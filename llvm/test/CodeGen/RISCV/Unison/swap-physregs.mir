@@ -1,0 +1,52 @@
+# Test: Physical register swap before a call.
+# Two vregs must be placed in specific physregs for the call arguments,
+# but the initial assignment is swapped: %0 starts in $x10 but the
+# call needs it in $x11, and vice versa.
+# The solver must insert a register copy to resolve the swap.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: swap_physregs:                          # @swap_physregs
+# CHECK:       addi	sp, sp, -16
+# CHECK:       sd	ra, 8(sp)                       # 8-byte Folded Spill
+# CHECK:       mv	a2, a0
+# CHECK:       mv	a3, a1
+# CHECK:       mv	a0, a3
+# CHECK:       mv	a1, a2
+# CHECK:       call	callee
+# CHECK:       ld	ra, 8(sp)                       # 8-byte Folded Reload
+# CHECK:       addi	sp, sp, 16
+# CHECK:       ret
+--- |
+  declare i64 @callee(i64, i64)
+  define i64 @swap_physregs(i64 %a, i64 %b) {
+    ; Call callee(b, a) — args are swapped.
+    %r = call i64 @callee(i64 %b, i64 %a)
+    ret i64 %r
+  }
+...
+---
+name:            swap_physregs
+tracksRegLiveness: true
+frameInfo:
+  adjustsStack:    true
+registers:
+  - { id: 0, class: gpr }    # a — arrives in $x10, needed in $x11
+  - { id: 1, class: gpr }    # b — arrives in $x11, needed in $x10
+  - { id: 2, class: gpr }    # return value
+body:             |
+  bb.0:
+    liveins: $x10, $x11
+    %0:gpr = COPY $x10
+    %1:gpr = COPY $x11
+    ADJCALLSTACKDOWN 0, 0, implicit-def dead $x2, implicit $x2
+    ; Call with swapped args: callee(b, a).
+    $x10 = COPY %1
+    $x11 = COPY %0
+    PseudoCALL target-flags(riscv-call) @callee, csr_ilp32d_lp64d, implicit-def dead $x1, implicit $x10, implicit $x11, implicit-def $x2, implicit-def $x10
+    ADJCALLSTACKUP 0, 0, implicit-def dead $x2, implicit $x2
+    %2:gpr = COPY $x10
+    $x10 = COPY %2
+    PseudoRET implicit $x10
+...

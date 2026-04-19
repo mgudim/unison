@@ -1,0 +1,48 @@
+# Test: Vreg live across a function call.
+# The vreg %0 is defined before the call and used after.
+# The call clobbers all caller-saved registers.
+# Expected: %0 assigned to a callee-saved register, or saved/restored
+# around the call via CopyOps.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: call_clobber:                           # @call_clobber
+# CHECK:       addi	sp, sp, -16
+# CHECK:       sd	ra, 8(sp)                       # 8-byte Folded Spill
+# CHECK:       sd	s0, 0(sp)                       # 8-byte Folded Spill
+# CHECK:       mv	s0, a0
+# CHECK:       call	external_func
+# CHECK:       mv	a0, s0
+# CHECK:       ld	ra, 8(sp)                       # 8-byte Folded Reload
+# CHECK:       ld	s0, 0(sp)                       # 8-byte Folded Reload
+# CHECK:       addi	sp, sp, 16
+# CHECK:       ret
+--- |
+  declare void @external_func()
+  define i64 @call_clobber(i64 %val) {
+    call void @external_func()
+    ret i64 %val
+  }
+...
+---
+name:            call_clobber
+tracksRegLiveness: true
+frameInfo:
+  adjustsStack:    true
+registers:
+  - { id: 0, class: gpr }
+body:             |
+  bb.0:
+    liveins: $x10
+    %0:gpr = COPY $x10
+
+    ; Call clobbers all caller-saved registers.
+    ADJCALLSTACKDOWN 0, 0, implicit-def dead $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @external_func, csr_ilp32d_lp64d, implicit-def dead $x1, implicit-def $x2
+    ADJCALLSTACKUP 0, 0, implicit-def dead $x2, implicit $x2
+
+    ; Use %0 after the call.
+    $x10 = COPY %0
+    PseudoRET implicit $x10
+...

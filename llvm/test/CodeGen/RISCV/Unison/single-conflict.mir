@@ -1,0 +1,43 @@
+# Test: Single register conflict.
+# Physical register $x10 is busy (load then store) while vreg %0 is live.
+# The vreg must be assigned to a register other than $x10.
+# Expected: %0 avoids $x10, no spills needed.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: single_conflict:                        # @single_conflict
+# CHECK:       mv	a1, a0
+# CHECK:       lui	a0, %hi(g)
+# CHECK:       sd	zero, %lo(g)(a0)
+# CHECK:       sd	a1, %lo(g)(a0)
+# CHECK:       ret
+--- |
+  @g = global i64 0
+  define void @single_conflict(i64 %a) {
+    store i64 42, ptr @g
+    store i64 %a, ptr @g
+    ret void
+  }
+...
+---
+name:            single_conflict
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+body:             |
+  bb.0:
+    liveins: $x10
+    ; %0 is live from here...
+    %0:gpr = COPY $x10
+
+    ; $x10 is now busy: used as a scratch for a load/store pair.
+    ; This creates a physreg live range for $x10 that overlaps %0.
+    $x10 = LUI target-flags(riscv-hi) @g
+    SD $x0, $x10, target-flags(riscv-lo) @g :: (store (s64))
+
+    ; ...to here. %0 must NOT be in $x10.
+    $x10 = LUI target-flags(riscv-hi) @g
+    SD %0, $x10, target-flags(riscv-lo) @g :: (store (s64))
+    PseudoRET
+...

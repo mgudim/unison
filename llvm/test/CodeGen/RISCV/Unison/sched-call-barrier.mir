@@ -1,0 +1,44 @@
+# Test: Function call is an ordering barrier.
+# Instructions before the call must stay before it.
+# Instructions after the call must stay after it.
+# Pure instructions within each region can be freely reordered.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN:   -unison-preserve-orig-instr-order=false %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: sched_call_barrier:                     # @sched_call_barrier
+# CHECK:       addi	sp, sp, -16
+# CHECK:       sd	ra, 8(sp)                       # 8-byte Folded Spill
+# CHECK:       call	external_func
+# CHECK:       li	a2, 7
+# CHECK:       sd	a2, 0(zero)
+# CHECK:       ld	ra, 8(sp)                       # 8-byte Folded Reload
+# CHECK:       addi	sp, sp, 16
+# CHECK:       ret
+--- |
+  declare void @external_func()
+  define void @sched_call_barrier() {
+    call void @external_func()
+    ret void
+  }
+...
+---
+name:            sched_call_barrier
+tracksRegLiveness: true
+frameInfo:
+  adjustsStack:    true
+body:             |
+  bb.0:
+    ; Before call: two independent pure instructions.
+    $x10 = ADDI $x0, 42
+    $x11 = ADDI $x0, 99
+    ; Call is a barrier.
+    ADJCALLSTACKDOWN 0, 0, implicit-def dead $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @external_func, csr_ilp32d_lp64d, implicit-def dead $x1, implicit-def $x2
+    ADJCALLSTACKUP 0, 0, implicit-def dead $x2, implicit $x2
+    ; After call: use a value. Must come after the call.
+    $x12 = ADDI $x0, 7
+    SD $x12, $x0, 0 :: (store (s64))
+    PseudoRET
+...

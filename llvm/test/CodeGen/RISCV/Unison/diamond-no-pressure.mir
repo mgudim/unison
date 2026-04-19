@@ -1,0 +1,57 @@
+# Test: Diamond CFG, vreg live through both sides, no register pressure.
+# The vreg %0 is defined in the entry block and used in the exit block.
+# Both sides of the diamond are simple (no calls, no pressure).
+# Expected: %0 in a caller-saved register, no spills.
+#
+#   bb.0 (entry)
+#   / \
+#  bb.1 bb.2
+#   \ /
+#   bb.3 (exit)
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: diamond_no_pressure:                    # @diamond_no_pressure
+# CHECK:       ret
+--- |
+  define i64 @diamond_no_pressure(i64 %val, i1 %cond) {
+  entry:
+    br i1 %cond, label %left, label %right
+  left:
+    br label %exit
+  right:
+    br label %exit
+  exit:
+    ret i64 %val
+  }
+...
+---
+name:            diamond_no_pressure
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+  - { id: 1, class: gpr }
+body:             |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10, $x11
+    %0:gpr = COPY $x10
+    %1:gpr = COPY $x11
+    BNE %1, $x0, %bb.2
+
+  bb.1:
+    successors: %bb.3
+    ; Left side — no register pressure.
+    PseudoBR %bb.3
+
+  bb.2:
+    successors: %bb.3
+    ; Right side — no register pressure.
+    PseudoBR %bb.3
+
+  bb.3:
+    ; Use %0 at the exit.
+    $x10 = COPY %0
+    PseudoRET implicit $x10
+...

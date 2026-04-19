@@ -1,0 +1,22 @@
+Unison CP-SAT Register Allocator — TODO
+========================================
+
+Presolving: feed greedy/linear-scan solution as CP-SAT hints - this way solver just tries to improve on already good solution..
+Create several heuristics and encode them as "soft" constraints.
+
+Support real scheduling models
+
+Fix remaining MIR test issues.
+Add ability to pre-assign variables from an external file. This would
+let us test specific solver scenarios (e.g. force a particular register
+assignment or spill decision) without waiting for the solver to find them.
+
+Benchmarks (ordered by complexity)
+----------------------------------
+1. E2E tests — single-function, 1-3 BBs, low register pressure
+2. Livermore Loops — isolated loop kernels, no calls
+3. PolyBench/C — small nested loop kernels
+4. Embench — single-function embedded kernels
+5. Coremark — moderate control flow
+6. Stanford — recursive algorithms, multiple functions, call-heavy
+7. LLVM test-suite SingleSource

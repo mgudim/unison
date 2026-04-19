@@ -1,0 +1,32 @@
+# Test: Copy coalescing.
+# The vreg %0 is a COPY of $x10. If the solver assigns %0 to $x10,
+# the COPY becomes an identity and is eliminated.
+# Expected: %0 coalesced to $x10, no COPY in output.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: coalesce:                               # @coalesce
+# CHECK:       addi	a1, a0, 1
+# CHECK:       mv	a0, a1
+# CHECK:       ret
+--- |
+  define i64 @coalesce(i64 %a) {
+    %r = add i64 %a, 1
+    ret i64 %r
+  }
+...
+---
+name:            coalesce
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+  - { id: 1, class: gpr }
+body:             |
+  bb.0:
+    liveins: $x10
+    %0:gpr = COPY $x10
+    %1:gpr = ADDI %0, 1
+    $x10 = COPY %1
+    PseudoRET implicit $x10
+...

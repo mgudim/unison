@@ -1,0 +1,104 @@
+# Test: Forced memory spill — no register available in the busy region.
+# ALL caller-saved registers are busy in the middle region. The vreg
+# must be spilled to memory (store before, load after).
+#
+# Timeline:
+#   def %0  |  ALL regs busy (must spill)  |  use %0
+#
+# Expected: store %0 to stack before the busy region, reload after.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: spill_between_regions:                  # @spill_between_regions
+# CHECK:       addi	sp, sp, -16
+# CHECK:       sd	s0, 8(sp)                       # 8-byte Folded Spill
+# CHECK:       mv	s0, a0
+# CHECK:       li	a0, 1
+# CHECK:       li	a1, 2
+# CHECK:       li	a2, 3
+# CHECK:       li	a3, 4
+# CHECK:       li	a4, 5
+# CHECK:       li	a5, 6
+# CHECK:       li	a6, 7
+# CHECK:       li	a7, 8
+# CHECK:       li	t0, 9
+# CHECK:       li	t1, 10
+# CHECK:       li	t2, 11
+# CHECK:       li	t3, 12
+# CHECK:       li	t4, 13
+# CHECK:       li	t5, 14
+# CHECK:       li	t6, 15
+# CHECK:       sd	a0, 0(zero)
+# CHECK:       sd	a1, 8(zero)
+# CHECK:       sd	a2, 16(zero)
+# CHECK:       sd	a3, 24(zero)
+# CHECK:       sd	a4, 32(zero)
+# CHECK:       sd	a5, 40(zero)
+# CHECK:       sd	a6, 48(zero)
+# CHECK:       sd	a7, 56(zero)
+# CHECK:       sd	t0, 64(zero)
+# CHECK:       sd	t1, 72(zero)
+# CHECK:       sd	t2, 80(zero)
+# CHECK:       sd	t3, 88(zero)
+# CHECK:       sd	t4, 96(zero)
+# CHECK:       sd	t5, 104(zero)
+# CHECK:       sd	t6, 112(zero)
+# CHECK:       mv	a0, s0
+# CHECK:       ld	s0, 8(sp)                       # 8-byte Folded Reload
+# CHECK:       addi	sp, sp, 16
+# CHECK:       ret
+--- |
+  define i64 @spill_between_regions(i64 %val) {
+    ret i64 %val
+  }
+...
+---
+name:            spill_between_regions
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+body:             |
+  bb.0:
+    liveins: $x10
+    %0:gpr = COPY $x10
+
+    ; ALL caller-saved registers busy simultaneously.
+    ; Each has a def followed by a use, creating overlapping live ranges.
+    $x10 = ADDI $x0, 1
+    $x11 = ADDI $x0, 2
+    $x12 = ADDI $x0, 3
+    $x13 = ADDI $x0, 4
+    $x14 = ADDI $x0, 5
+    $x15 = ADDI $x0, 6
+    $x16 = ADDI $x0, 7
+    $x17 = ADDI $x0, 8
+    $x5 = ADDI $x0, 9
+    $x6 = ADDI $x0, 10
+    $x7 = ADDI $x0, 11
+    $x28 = ADDI $x0, 12
+    $x29 = ADDI $x0, 13
+    $x30 = ADDI $x0, 14
+    $x31 = ADDI $x0, 15
+    ; Use all — they're all live through this point.
+    SD $x10, $x0, 0 :: (store (s64))
+    SD $x11, $x0, 8 :: (store (s64))
+    SD $x12, $x0, 16 :: (store (s64))
+    SD $x13, $x0, 24 :: (store (s64))
+    SD $x14, $x0, 32 :: (store (s64))
+    SD $x15, $x0, 40 :: (store (s64))
+    SD $x16, $x0, 48 :: (store (s64))
+    SD $x17, $x0, 56 :: (store (s64))
+    SD $x5, $x0, 64 :: (store (s64))
+    SD $x6, $x0, 72 :: (store (s64))
+    SD $x7, $x0, 80 :: (store (s64))
+    SD $x28, $x0, 88 :: (store (s64))
+    SD $x29, $x0, 96 :: (store (s64))
+    SD $x30, $x0, 104 :: (store (s64))
+    SD $x31, $x0, 112 :: (store (s64))
+
+    ; Use %0 — all caller-saved were busy, so %0 was either in a
+    ; callee-saved reg or spilled to memory.
+    $x10 = COPY %0
+    PseudoRET implicit $x10
+...

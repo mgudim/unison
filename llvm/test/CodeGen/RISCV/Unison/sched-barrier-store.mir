@@ -1,0 +1,40 @@
+# Test: Store is an ordering barrier.
+# Two ADDIs feed a store. The store must come after both ADDIs.
+# A third ADDI after the store is independent of the first two
+# but must come after the store.
+#
+# With preserve-order off, the solver can reorder pure instructions
+# within a barrier-free region but cannot move them across barriers.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN:   -unison-preserve-orig-instr-order=false %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: sched_barrier_store:                    # @sched_barrier_store
+# CHECK:       li	a1, 1
+# CHECK:       li	a3, 3
+# CHECK:       sd	a1, 0(a0)
+# CHECK:       sd	a3, 8(a0)
+# CHECK:       ret
+--- |
+  define void @sched_barrier_store() {
+    ret void
+  }
+...
+---
+name:            sched_barrier_store
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    ; Pure instructions — can be reordered.
+    $x11 = ADDI $x0, 1
+    $x12 = ADDI $x0, 2
+    ; Store is a barrier — must come after the ADDIs above.
+    SD $x11, $x10, 0 :: (store (s64))
+    ; This ADDI must come after the store.
+    $x13 = ADDI $x0, 3
+    ; Second store — barrier.
+    SD $x13, $x10, 8 :: (store (s64))
+    PseudoRET
+...

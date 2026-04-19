@@ -1,0 +1,45 @@
+# Test: Multiple barriers create ordered regions.
+# Three stores create three barrier points. Pure instructions between
+# each pair of stores can be reordered within their region but cannot
+# cross a store.
+#
+#   region1: [ADDI, ADDI] → store1 → region2: [ADDI] → store2 → region3: [ADDI] → store3
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN:   -unison-preserve-orig-instr-order=false %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: sched_multi_barrier:                    # @sched_multi_barrier
+# CHECK:       li	a1, 1
+# CHECK:       li	a3, 3
+# CHECK:       li	a4, 4
+# CHECK:       sd	a1, 0(a0)
+# CHECK:       sd	a3, 8(a0)
+# CHECK:       sd	a4, 16(a0)
+# CHECK:       ret
+--- |
+  define void @sched_multi_barrier() {
+    ret void
+  }
+...
+---
+name:            sched_multi_barrier
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    ; Region 1: two pure instructions.
+    $x11 = ADDI $x0, 1
+    $x12 = ADDI $x0, 2
+    ; Barrier 1.
+    SD $x11, $x10, 0 :: (store (s64))
+    ; Region 2: one pure instruction.
+    $x13 = ADDI $x0, 3
+    ; Barrier 2.
+    SD $x13, $x10, 8 :: (store (s64))
+    ; Region 3: one pure instruction.
+    $x14 = ADDI $x0, 4
+    ; Barrier 3.
+    SD $x14, $x10, 16 :: (store (s64))
+    PseudoRET
+...

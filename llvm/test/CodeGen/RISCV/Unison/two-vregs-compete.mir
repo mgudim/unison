@@ -1,0 +1,46 @@
+# Test: Two vregs with overlapping live ranges.
+# Both %0 and %1 are live simultaneously, so they must be assigned
+# to different physical registers.
+# Expected: %0 and %1 in different registers, no spills.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: two_vregs_compete:                      # @two_vregs_compete
+# CHECK:       mv	a2, a0
+# CHECK:       mv	a3, a1
+# CHECK:       add	a1, a2, a3
+# CHECK:       sub	a4, a2, a3
+# CHECK:       add	a2, a1, a4
+# CHECK:       mv	a0, a2
+# CHECK:       ret
+--- |
+  define i64 @two_vregs_compete(i64 %a, i64 %b) {
+    %sum = add i64 %a, %b
+    %diff = sub i64 %a, %b
+    %r = add i64 %sum, %diff
+    ret i64 %r
+  }
+...
+---
+name:            two_vregs_compete
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+  - { id: 1, class: gpr }
+  - { id: 2, class: gpr }
+  - { id: 3, class: gpr }
+  - { id: 4, class: gpr }
+body:             |
+  bb.0:
+    liveins: $x10, $x11
+    %0:gpr = COPY $x10
+    %1:gpr = COPY $x11
+    ; %0 and %1 both live here.
+    %2:gpr = ADD %0, %1
+    %3:gpr = SUB %0, %1
+    ; %2 and %3 both live here.
+    %4:gpr = ADD %2, %3
+    $x10 = COPY %4
+    PseudoRET implicit $x10
+...

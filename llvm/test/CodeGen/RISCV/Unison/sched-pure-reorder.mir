@@ -1,0 +1,37 @@
+# Test: Pure instructions can be reordered by the solver.
+# Three independent ADDIs with no barriers between them.
+# The solver is free to schedule them in any order.
+# The makespan objective should still produce a valid schedule.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN:   -unison-preserve-orig-instr-order=false %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: sched_pure_reorder:                     # @sched_pure_reorder
+# CHECK:       li	a0, 1
+# CHECK:       li	a1, 2
+# CHECK:       li	a2, 3
+# CHECK:       sd	a0, 0(zero)
+# CHECK:       sd	a1, 8(zero)
+# CHECK:       sd	a2, 16(zero)
+# CHECK:       ret
+--- |
+  define void @sched_pure_reorder() {
+    ret void
+  }
+...
+---
+name:            sched_pure_reorder
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; Three independent pure instructions. No barriers.
+    $x10 = ADDI $x0, 1
+    $x11 = ADDI $x0, 2
+    $x12 = ADDI $x0, 3
+    ; Use all three at the end (store is a barrier).
+    SD $x10, $x0, 0 :: (store (s64))
+    SD $x11, $x0, 8 :: (store (s64))
+    SD $x12, $x0, 16 :: (store (s64))
+    PseudoRET
+...
