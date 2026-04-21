@@ -20,3 +20,162 @@ Benchmarks (ordered by complexity)
 5. Coremark — moderate control flow
 6. Stanford — recursive algorithms, multiple functions, call-heavy
 7. LLVM test-suite SingleSource
+
+
+  1. Presolver Nogoods
+
+  What it does: A "nogood" is a forbidden assignment — a combination of variable values that is provably infeasible.
+  Before the solver even starts searching, the presolver analyzes the problem and identifies assignments that can never
+   be part of a valid solution.
+
+  How it works: For each operand and its candidate temporaries/registers, check if the assignment is structurally
+  impossible:
+
+  - Register domain disjointness: Operand p can use registers {x10, x11, x12}. Temporary t7 can only be in {fa0, fa1}
+  (float regs). Assignment p→t7 is a nogood because their register domains don't intersect.
+  - Redefined operand conflicts: If two operations both define the same operand with overlapping temporaries but
+  incompatible latencies, certain instruction/temporary combos are nogoods.
+  - Chained incompatibilities: If operand p1 uses temporary t, and operand p2 uses the same temporary t, but p1
+  requires register class A and p2 requires class B where A∩B=∅, then (p1→t, p2→t) is a nogood.
+
+  What we can take: We could precompute domain intersections between vreg defs and their potential registers. If a
+  vreg's register class has been narrowed by copy coalescing or calling convention constraints, we can restrict the
+  CP-SAT variable domains before solving. Currently we let CP-SAT discover these infeasibilities during search, which
+  wastes time.
+
+  Implementation sketch: Before calling Model.Build(), iterate all UnisonUseOperand::PotentialDefs. For each choice,
+  check if the def's register domain intersects the use's required domain. If not, fix ChoiceVar != that_index.
+  Similarly, check if a def's domain intersects with all its potential uses' domains.
+
+  ---
+  2. Dominated Uses
+
+  What it does: If temporary t is defined at operation d, used at u1, then used again at u2, and u1 always executes
+  before u2 (provable from the dependency graph), then u2 is "dominated" by u1. The live range of t must extend at
+  least from d to u2, and the register assigned to t at u1 must still hold t at u2.
+
+  How it works: Build the precedence graph (which operations must come before which). For each temporary, find its def
+  and all uses. If use u1 precedes use u2 in the graph, then:
+  - t's live range covers both u1 and u2
+  - The register holding t cannot be freed between u1 and u2
+  - Any spill decision for t must account for both uses
+
+  How it reduces search: Without this, the solver might explore solutions where t is in register r at u1, spilled
+  between u1 and u2, and reloaded into register r' at u2 — when it's provably unnecessary (t is already in r and r
+  isn't clobbered between u1 and u2). The dominated use tells the solver: "don't bother exploring the case where u2
+  uses a different copy of t than u1."
+
+  What we can take: In our copyExtend, we insert a LoadMove for every use. If use u2 is dominated by u1 (same basic
+  block, u1 before u2, no barrier between them), we could wire u2 to the same LoadMove as u1 instead of creating a
+  separate one. This reduces the number of CopyOps and solver variables.
+
+  ---
+  3. Global/Local Decomposition
+
+  What it does: Instead of solving the entire function as one monolithic problem (which is what we do), split it into:
+  - Global model: Decides coarse-grained register allocation — which register class (integer, float, memory) each
+  cross-block value gets, which copies are active, which operations are enabled. This is a smaller problem.
+  - Local models (per-block): Given the global decisions, each block independently decides exact register assignments
+  and instruction scheduling. These are small, fast problems.
+
+  How they communicate:
+  1. Global model makes coarse decisions (register spaces, copy activation)
+  2. For each block, a local model is spawned with those decisions as constraints
+  3. If a local model is infeasible (can't schedule within the global constraints), the global model backtracks and
+  tries different coarse decisions
+  4. When all local models succeed, the combined solution is feasible
+
+  Why it helps: Our monolithic approach has variables for every instruction × every register × every issue cycle across
+   all blocks. The search space is exponential in the number of variables. Decomposition makes each subproblem much
+  smaller:
+  - Global: ~N_vregs variables for register spaces (small domains)
+  - Local per block: ~N_instrs_in_block variables (small)
+
+  What we can take: This is the single biggest improvement for scalability. We could:
+  1. First solve a simplified global model (just register class + memory decisions for cross-block vregs)
+  2. Then solve each MBB independently with those decisions fixed
+  3. If a block fails, relax and re-solve globally
+
+  This would let us handle functions that currently timeout. The per-block problems are similar in size to what we
+  already solve successfully.
+
+  ---
+  4. Symmetry Breaking
+
+  What it does: Many different register assignments are functionally identical. If vregs %1 and %2 don't interfere and
+  both can use {x10, x11}, then (%1→x10, %2→x11) and (%1→x11, %2→x10) are equivalent. The solver wastes time exploring
+  both.
+
+  The 4 types:
+
+  1. Register value precedence: For temporaries that can use the same set of registers, enforce an ordering: t1 gets a
+  lower-numbered register than t2. Cuts the search space by up to N! for N symmetric temporaries.
+  2. Operand symmetry: Congruent operands (same value at block boundaries) must have the same register. Enforce
+  ordering among congruence classes.
+  3. Copy symmetry: If two copy operations have identical instruction choices and operand connections, they're
+  interchangeable. Order them to prevent exploring permutations.
+  4. Temporary symmetry: Within a congruence class, if multiple temporaries can serve the same purpose, order them.
+
+  What we can take: CP-SAT has AddLessOrEqual which can express value precedence directly. For our model:
+  - Find pairs of vregs with identical register domains and no interference
+  - Add Reg.Var[vreg1] <= Reg.Var[vreg2]
+  - This is simple to implement and could significantly help the solver, especially with num_workers > 1 where
+  different workers explore symmetric parts of the search space.
+
+  ---
+  5. Pressure-Aware Branching
+
+  What it does: Controls the order in which the solver makes decisions. Instead of branching on variables in arbitrary
+  order, prioritize decisions that affect register pressure most.
+
+  The key insight: Each operation is either a "consumer" (uses more registers than it defines) or a "producer" (defines
+   more than it uses). The pressure_balance metric quantifies this:
+  pressure_balance(op) = sum(use_pressures) - sum(def_pressures)
+  pressure(operand) = width / num_available_registers
+
+  Branching strategy:
+  - Consumers (positive pressure_balance): Schedule them as early as possible. This frees up the input registers
+  quickly, reducing live pressure.
+  - Producers (negative pressure_balance): Schedule them as late as possible (just before their first consumer). This
+  minimizes the time their output registers are live.
+
+  What we can take: CP-SAT has AddDecisionStrategy which lets us specify variable/value ordering. We could:
+  1. Compute pressure_balance for each instruction
+  2. Use AddDecisionStrategy to branch on high-pressure instructions first
+  3. For producers, hint the solver to prefer later issue cycles; for consumers, prefer earlier cycles
+
+  This doesn't change the solution space but helps the solver find good solutions faster, which directly addresses our
+  timeout problem.
+
+  ---
+  6. Across Constraints
+
+  What it does: At a function call, caller-saved registers are clobbered. Any value that's live across the call must
+  either be in a callee-saved register or spilled. "Across constraints" explicitly model which temporaries cross call
+  boundaries and what register restrictions this implies.
+
+  How it works: For each call operation:
+  1. Find all temporaries defined before the call and used after it
+  2. For each such temporary, generate a constraint: "if this temporary is in a caller-saved register, a spill/reload
+  pair must be active"
+  3. Generate nogoods for impossible assignments (e.g., "temporary in caller-saved register but no spill operation
+  exists for it")
+
+  What we can take: We already handle call clobbers via regmask defs in NoOverlap2D — clobbered registers get minimal
+  rectangles at the call's IC. But we could precompute across information to:
+  - Pre-narrow domains of cross-call vregs to callee-saved registers + memory
+  - Generate stronger hints for the solver (prefer callee-saved for cross-call values)
+  - Detect infeasible cases early (too many cross-call values for available callee-saved registers → must spill)
+
+  ---
+  Priority for Implementation
+
+  Based on expected impact on our scalability/quality issues:
+
+1. Global/Local decomposition — biggest scalability win, unblocks complex functions
+2. Symmetry breaking — easy to implement, directly helps multi-worker solver
+3. Pressure-aware branching — moderate effort, helps find good solutions faster
+4. Presolver nogoods — domain reduction before solving, reduces timeout risk
+5. Dominated uses — reduces CopyOp count, smaller model
+6. Across constraints — improves call-heavy code quality (Stanford benchmarks)
+
