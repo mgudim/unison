@@ -48,8 +48,11 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
@@ -65,9 +68,11 @@
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "ortools/sat/cp_model.h"
@@ -113,6 +118,18 @@ static cl::opt<int> UnisonNumWorkers(
     "unison-num-workers",
     cl::desc("Number of CP-SAT solver workers (0 = auto-detect)"),
     cl::init(0),
+    cl::Hidden);
+
+static cl::opt<std::string> UnisonDumpSolution(
+    "unison-dump-solution",
+    cl::desc("Dump solver solution to file"),
+    cl::value_desc("filename"),
+    cl::Hidden);
+
+static cl::opt<std::string> UnisonPreAssign(
+    "unison-preassign",
+    cl::desc("Pre-assign variables from file"),
+    cl::value_desc("filename"),
     cl::Hidden);
 
 static cl::opt<bool> UnisonPreserveOrder(
@@ -204,7 +221,7 @@ public:
 
     SmallVector<UnisonDefOperand, 4> Defs;
     SmallVector<UnisonUseOperand, 4> Uses;
-    std::string Name; // Debug name for tracing.
+    SmallString<32> Name; // Debug name for tracing.
 
     UnisonDefOperand &getDef(unsigned Idx) { return Defs[Idx]; }
     UnisonUseOperand &getUse(unsigned Idx) { return Uses[Idx]; }
@@ -229,6 +246,56 @@ public:
 
     // Equivalence classes of def operands that must share a PhysRegVar.
     DenseMap<Register, SmallVector<DefRef, 2>> VRegDefClass;
+  };
+
+  // --- Variable naming and lookup ---
+
+  class NamingScheme {
+    bool BuildMap;
+    StringMap<sat::IntVar> VarByName;
+
+    void registerVar(StringRef Name, sat::IntVar Var) {
+      Var.WithName(Name.str());
+      if (BuildMap)
+        VarByName[Name] = Var;
+    }
+
+    void registerBoolVar(StringRef Name, sat::BoolVar Var) {
+      Var.WithName(Name.str());
+      if (BuildMap)
+        VarByName[Name] = sat::IntVar(Var);
+    }
+
+  public:
+    NamingScheme(bool BuildMap = false) : BuildMap(BuildMap) {}
+
+    static SmallString<32> nameVariable(StringRef InstrName,
+                                        const Twine &VarSuffix) {
+      SmallString<32> Result(InstrName);
+      Result += ".";
+      VarSuffix.toVector(Result);
+      return Result;
+    }
+
+    void nameInstruction(UnisonInstr *UI, StringRef MBBPrefix,
+                         unsigned InstrIdx);
+    void nameAllVariablesInInstruction(UnisonInstr *UI);
+
+    void nameActiveVar(UnisonInstr *UI, sat::BoolVar Active) {
+      registerBoolVar(nameVariable(UI->Name, "active"), Active);
+    }
+
+    void renameDefReg(UnisonInstr *UI, unsigned DefIdx, sat::IntVar Var) {
+      registerVar(nameVariable(UI->Name, "def[" + Twine(DefIdx) + "].reg"),
+                  Var);
+    }
+
+    std::optional<sat::IntVar> lookupVar(StringRef Name) const {
+      auto It = VarByName.find(Name);
+      if (It == VarByName.end())
+        return std::nullopt;
+      return It->second;
+    }
   };
 
   // --- Analyses needed from the pass ---
@@ -257,7 +324,8 @@ public:
 
   // --- Interface ---
 
-  Unison(Analyses &A, MachineFunction &MF) : A(A), MF(MF) {}
+  Unison(Analyses &A, MachineFunction &MF)
+      : A(A), MF(MF), NS(!UnisonPreAssign.empty()) {}
   bool run();
 
 private:
@@ -423,6 +491,8 @@ private:
   // Build dense register index: MCRegToIdx, IdxToMCReg, RCDomain.
   void buildURegisterDomains();
 
+  NamingScheme NS;
+
   // --- Pipeline stages ---
   void buildUnisonInstructionsAndAnalyzeDefs();
   void assignPhysRegVarsFromEqClasses();
@@ -472,6 +542,8 @@ private:
   // def and use are at different registers (non-identity copy).
   sat::BoolVar getIsNotIdentityCopy(UnisonInstr *UInstr);
   void solve();
+  void dumpSolution(StringRef Filename);
+  void loadPreAssignments(StringRef Filename);
   void generateCodeFromSolution();
 
   // --- Code generation phases ---
@@ -766,6 +838,82 @@ void Unison::buildURegisterDomains() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Variable naming
+// ---------------------------------------------------------------------------
+
+// Opcode constants for CopyOp instruction selection.
+enum CopyOpcode : unsigned {
+  COPY_STORE = 0, // Spill to memory: def domain = memory slots.
+  COPY_MOVE = 1,  // Register-to-register move: both domains = registers.
+  COPY_LOAD = 2,  // Reload from memory: use domain = memory, def = registers.
+  COPY_REMAT = 3, // Rematerialize: recompute value instead of loading.
+};
+
+// ---------------------------------------------------------------------------
+// NamingScheme implementation
+// ---------------------------------------------------------------------------
+
+void Unison::NamingScheme::nameInstruction(UnisonInstr *UI,
+                                           StringRef MBBPrefix,
+                                           unsigned InstrIdx) {
+  switch (UI->K) {
+  case UnisonInstr::LiveInDef:
+    UI->Name = MBBPrefix;
+    UI->Name += ".LI";
+    break;
+  case UnisonInstr::LiveOutUse:
+    UI->Name = MBBPrefix;
+    UI->Name += ".LO";
+    break;
+  case UnisonInstr::RealInstr:
+    UI->Name = MBBPrefix;
+    UI->Name += ".RI";
+    UI->Name += Twine(InstrIdx).str();
+    break;
+  case UnisonInstr::CopyOp: {
+    // Walk use[0] → parent def → parent instruction.
+    assert(!UI->Uses.empty() && !UI->Uses[0].PotentialDefs.empty());
+    DefRef ParentDR = UI->Uses[0].PotentialDefs[0];
+
+    bool IsStoreMove = UI->AltOpcodes[0] == COPY_STORE;
+    if (IsStoreMove) {
+      UI->Name = ParentDR.UInstr->Name;
+      UI->Name += ".d";
+      UI->Name += Twine(ParentDR.Idx).str();
+      UI->Name += ".SM";
+    } else {
+      assert(ParentDR.UInstr->isCopyOp());
+      DefRef RealDR = ParentDR.UInstr->Uses[0].PotentialDefs[0];
+      assert(!UI->Defs[0].PotentialUses.empty());
+      UnisonInstr *UseInstr = UI->Defs[0].PotentialUses[0].UInstr;
+
+      UI->Name = RealDR.UInstr->Name;
+      UI->Name += ".d";
+      UI->Name += Twine(RealDR.Idx).str();
+      UI->Name += ".LM_";
+      UI->Name += UseInstr->Name;
+    }
+    break;
+  }
+  }
+}
+
+void Unison::NamingScheme::nameAllVariablesInInstruction(UnisonInstr *UI) {
+  registerVar(nameVariable(UI->Name, "ic"), UI->IssueCycle);
+
+  for (unsigned I = 0; I < UI->Defs.size(); I++)
+    registerVar(nameVariable(UI->Name, "def[" + Twine(I) + "].reg"),
+                UI->Defs[I].Reg.Var);
+
+  for (unsigned I = 0; I < UI->Uses.size(); I++)
+    registerVar(nameVariable(UI->Name, "use[" + Twine(I) + "].choice"),
+                UI->Uses[I].ChoiceVar);
+
+  if (UI->isCopyOp())
+    registerVar(nameVariable(UI->Name, "ins"), UI->Ins);
+}
+
 void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
   // Traverse MBBs in reverse post-order. RPO guarantees that a block is
   // visited before any block it dominates (assuming reducible CFG), so the
@@ -793,23 +941,18 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
     // letting the solver space them apart for CopyOps.
     UnisonInstr *PrevRealInstr = nullptr;
     unsigned RICount = 0;
-    std::string MBBPrefix = "MBB" + std::to_string(MBB->getNumber());
+    SmallString<16> MBBPrefix("MBB");
+    MBBPrefix += Twine(MBB->getNumber()).str();
     auto addUnisonInstr = [&](UnisonInstr::Kind K, MachineInstr *RealMI) {
       UnisonInstr *UInstr = createUnisonInstr(UMBB->Instrs, K, RealMI);
-      // Name the instruction and its IC variable.
+      NS.nameInstruction(UInstr, MBBPrefix, RICount);
+      if (K == UnisonInstr::RealInstr)
+        RICount++;
       if (K == UnisonInstr::LiveInDef) {
-        UInstr->Name = MBBPrefix + ".LI";
         UInstr->IssueCycle = Model.NewConstant(0);
-      } else if (K == UnisonInstr::LiveOutUse) {
-        UInstr->Name = MBBPrefix + ".LO";
-        UInstr->IssueCycle = Model.NewIntVar(
-            operations_research::Domain(0, UB))
-            .WithName(UInstr->Name + ".IC");
       } else {
-        UInstr->Name = MBBPrefix + ".RI" + std::to_string(RICount++);
         UInstr->IssueCycle = Model.NewIntVar(
-            operations_research::Domain(0, UB))
-            .WithName(UInstr->Name + ".IC");
+            operations_research::Domain(0, UB));
       }
       if (K == UnisonInstr::RealInstr && UnisonPreserveOrder) {
         UnisonInstr *Prev = PrevRealInstr ? PrevRealInstr
@@ -818,6 +961,7 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
         PrevRealInstr = UInstr;
       }
       populateDefsAndUses(UInstr, *MBB, LocalReachingDefs);
+      NS.nameAllVariablesInInstruction(UInstr);
       return UInstr;
     };
 
@@ -857,18 +1001,13 @@ void Unison::assignPhysRegVarsFromEqClasses() {
     operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
     sat::IntVar PhysRegVar = Model.NewIntVar(Dom);
     VRegToPhysRegVar[Reg] = PhysRegVar;
-    for (DefRef DR : DefOps)
+    for (DefRef DR : DefOps) {
       DR.UInstr->getDef(DR.Idx).Reg.Var = PhysRegVar;
+      // Re-apply name: the per-def variable was replaced by the shared one.
+      NS.renameDefReg(DR.UInstr, DR.Idx, PhysRegVar);
+    }
   }
 }
-
-// Opcode constants for CopyOp instruction selection.
-enum CopyOpcode : unsigned {
-  COPY_STORE = 0, // Spill to memory: def domain = memory slots.
-  COPY_MOVE = 1,  // Register-to-register move: both domains = registers.
-  COPY_LOAD = 2,  // Reload from memory: use domain = memory, def = registers.
-  COPY_REMAT = 3, // Rematerialize: recompute value instead of loading.
-};
 
 // Check if a MachineInstr is rematerializable: cheap, no memory access,
 // all use operands are constants or always-available (e.g., $x0).
@@ -947,7 +1086,6 @@ void Unison::copyExtend() {
 
         DefRef RealDR{UInstr, DefIdx};
         unsigned NumRealUses = DefOp.PotentialUses.size();
-        std::string DefName = UInstr->Name + ".d" + std::to_string(DefIdx);
 
         // --- Store-move: inserted right AFTER the def instruction ---
         auto DefIt = InstrToIter[UInstr];
@@ -955,7 +1093,6 @@ void Unison::copyExtend() {
         UnisonInstr *StoreMove = insertCopyOp(
             AfterDef, {COPY_STORE, COPY_MOVE},
             DefOp.Reg.Dom, DefOp.Reg.Dom.UnionWith(MemDomain));
-        StoreMove->Name = DefName + ".SM";
         StoreMove->Uses[0].ChoiceVar = Model.NewConstant(0);
         wireDefUse(RealDR, UseRef{StoreMove, 0});
         DefRef StoreMoveDR{StoreMove, 0};
@@ -976,7 +1113,6 @@ void Unison::copyExtend() {
           UnisonInstr *LoadMove = insertCopyOp(
               UseIt, LoadOpcodes,
               DefOp.Reg.Dom, DefOp.Reg.Dom.UnionWith(MemDomain));
-          LoadMove->Name = DefName + ".LM" + std::to_string(UI);
           if (CanRemat)
             LoadMove->RematMI = UInstr->RealMI;
           LoadMove->Uses[0].ChoiceVar = Model.NewConstant(0);
@@ -987,7 +1123,15 @@ void Unison::copyExtend() {
 
           if (RealUR.UInstr->K == UnisonInstr::LiveOutUse)
             addDefChoice(RealUR, StoreMoveDR);
+
+          // Name after wiring so nameInstruction can walk def-use chains.
+          NS.nameInstruction(LoadMove, {}, 0);
+          NS.nameAllVariablesInInstruction(LoadMove);
         }
+
+        // Name StoreMove after all LoadMoves are wired.
+        NS.nameInstruction(StoreMove, {}, 0);
+        NS.nameAllVariablesInInstruction(StoreMove);
       }
     }
   }
@@ -1209,32 +1353,64 @@ void Unison::addRectangle(UnisonMBB &UMBB, UnisonInstr *UInstr,
 }
 
 void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
+  operations_research::Domain PhysRegDomain(0, NumPhysRegs - 1);
+
   for (auto &UInstrPtr : UMBB.Instrs) {
     UnisonInstr *UInstr = UInstrPtr.get();
 
+    // --- Def-side constraints ---
     if (UInstr->K == UnisonInstr::RealInstr) {
-      // Real instruction defs: restrict to their register class.
       for (UnisonDefOperand &DefOp : UInstr->Defs)
         restrictToDomain(DefOp.Reg.Var, DefOp.Reg.Dom);
     } else if (UInstr->isCopyOp()) {
-      // CopyOp defs: domain depends on instruction selection.
       UnisonDefOperand &DefOp = UInstr->Defs[0];
       operations_research::Domain RegDom =
-          DefOp.Reg.Dom.IntersectionWith(
-              operations_research::Domain(0, NumPhysRegs - 1));
+          DefOp.Reg.Dom.IntersectionWith(PhysRegDomain);
 
       for (unsigned I = 0; I < UInstr->AltOpcodes.size(); ++I) {
         sat::BoolVar InsIsI = reifyEquality(UInstr->Ins, I);
         unsigned Opcode = UInstr->AltOpcodes[I];
-        if (Opcode == COPY_STORE) {
+        if (Opcode == COPY_STORE)
           restrictToDomain(DefOp.Reg.Var, MemDomain, InsIsI);
-        } else {
+        else
           restrictToDomain(DefOp.Reg.Var, RegDom, InsIsI);
-        }
       }
     }
-    // LiveInDef/LiveOutUse: defs already constrained via VRegDefClass
-    // (shared variable) or constant (phys reg).
+
+    // --- Use-side constraints: propagate source domain from uses to defs ---
+    // For each def, intersect its domain with the requirements of all its
+    // users. A real instruction use requires its source in register domain.
+    // A CopyOp use's requirement depends on the instruction alternative.
+    // A LiveOutUse has no restriction (synthetic, can accept register or memory).
+    for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
+      UnisonDefOperand &DefOp = UInstr->Defs[DI];
+      sat::IntVar DefReg = DefOp.Reg.Var;
+
+      for (const UseRef &UR : DefOp.PotentialUses) {
+        UnisonInstr *User = UR.UInstr;
+        sat::BoolVar Chosen = getDChosenInU(DefRef{UInstr, DI}, UR);
+
+        if (User->K == UnisonInstr::RealInstr) {
+          // Real instructions read from registers only.
+          restrictToDomain(DefReg, PhysRegDomain, Chosen);
+
+        } else if (User->isCopyOp()) {
+          // CopyOp source requirement depends on instruction alternative.
+          for (unsigned I = 0; I < User->AltOpcodes.size(); ++I) {
+            sat::BoolVar InsIsI = reifyEquality(User->Ins, I);
+            sat::BoolVar Both = reifyAnd(Chosen, InsIsI);
+            unsigned Opcode = User->AltOpcodes[I];
+            if (Opcode == COPY_LOAD) {
+              restrictToDomain(DefReg, MemDomain, Both);
+            } else if (Opcode == COPY_STORE || Opcode == COPY_MOVE) {
+              restrictToDomain(DefReg, PhysRegDomain, Both);
+            }
+            // COPY_REMAT: no source constraint (rematerialized).
+          }
+        }
+        // LiveOutUse/LiveInDef: no restriction on source domain.
+      }
+    }
   }
 }
 
@@ -1308,6 +1484,7 @@ void Unison::deriveActivationVars(UnisonMBB &UMBB) {
       Model.AddBoolAnd(NegBools).OnlyEnforceIf(~Active);
       IsActiveVar[UInstr] = Active;
     }
+    NS.nameActiveVar(UInstr, IsActiveVar[UInstr]);
   }
 }
 
@@ -1402,29 +1579,23 @@ void Unison::addOrderingConstraints(UnisonMBB &UMBB) {
 
   int UB = UMBB.IssueCycleUpperBound;
 
-  // Build MI → UnisonInstr map for fast lookup.
-  DenseMap<MachineInstr *, UnisonInstr *> MIToUI;
-  for (auto &UIP : UMBB.Instrs) {
-    if (UIP->K == UnisonInstr::RealInstr && UIP->RealMI)
-      MIToUI[UIP->RealMI] = UIP.get();
-  }
-
   // Track ICs since last barrier. When we hit a barrier, constrain it
   // after all of them, then reset.
   SmallVector<sat::IntVar, 16> ICsSinceLastBarrier;
   sat::IntVar LastBarrierIC;
   bool HaveBarrier = false;
 
-  // Process all instructions in program order, including terminators.
-  // Terminators are scheduling boundaries, so they'll be naturally
-  // chained in program order by the barrier logic.
-  for (auto &I : *UMBB.MBB) {
-    auto It = MIToUI.find(&I);
-    if (It == MIToUI.end())
+  // Process all instructions in list order (includes CopyOps).
+  // RealInstrs that are scheduling boundaries act as barriers.
+  // CopyOps and other non-barrier instructions are pure — they must
+  // stay within their barrier region.
+  for (auto &UIP : UMBB.Instrs) {
+    UnisonInstr *UI = UIP.get();
+    if (UI->K == UnisonInstr::LiveInDef || UI->K == UnisonInstr::LiveOutUse)
       continue;
-    UnisonInstr *UI = It->second;
 
-    bool IsBarrier = A.TII->isSchedulingBoundary(I, UMBB.MBB, MF);
+    bool IsBarrier = UI->K == UnisonInstr::RealInstr && UI->RealMI &&
+                     A.TII->isSchedulingBoundary(*UI->RealMI, UMBB.MBB, MF);
 
     if (IsBarrier) {
       // This barrier must come after all instructions since the last barrier.
@@ -1441,7 +1612,7 @@ void Unison::addOrderingConstraints(UnisonMBB &UMBB) {
       HaveBarrier = true;
       ICsSinceLastBarrier.clear();
     } else {
-      // Pure instruction: must come after the last barrier.
+      // Pure instruction (including CopyOps): must come after the last barrier.
       if (HaveBarrier)
         Model.AddGreaterThan(UI->IssueCycle, LastBarrierIC);
       ICsSinceLastBarrier.push_back(UI->IssueCycle);
@@ -1669,6 +1840,78 @@ void Unison::solve() {
 
   // Store response for use by generateCodeFromSolution.
   SolverResponse = Response;
+}
+
+void Unison::dumpSolution(StringRef Filename) {
+  std::error_code EC;
+  raw_fd_ostream OS(Filename, EC);
+  if (EC) {
+    errs() << "Unison: cannot open " << Filename << ": " << EC.message() << "\n";
+    return;
+  }
+
+  const auto &Response = SolverResponse;
+  OS << "# Solution for " << MF.getName() << "\n";
+  for (auto &UMBB : UFunc.MBBs) {
+    OS << "# MBB#" << UMBB->MBB->getNumber() << "\n";
+    for (auto &UIP : UMBB->Instrs) {
+      UnisonInstr *UI = UIP.get();
+      OS << NamingScheme::nameVariable(UI->Name, "ic") << " = "
+         << sat::SolutionIntegerValue(Response, UI->IssueCycle) << "\n";
+      for (unsigned I = 0; I < UI->Defs.size(); I++)
+        OS << NamingScheme::nameVariable(UI->Name,
+               "def[" + Twine(I) + "].reg") << " = "
+           << sat::SolutionIntegerValue(Response, UI->Defs[I].Reg.Var)
+           << "\n";
+      for (unsigned I = 0; I < UI->Uses.size(); I++)
+        OS << NamingScheme::nameVariable(UI->Name,
+               "use[" + Twine(I) + "].choice") << " = "
+           << sat::SolutionIntegerValue(Response, UI->Uses[I].ChoiceVar)
+           << "\n";
+      if (UI->isCopyOp()) {
+        OS << NamingScheme::nameVariable(UI->Name, "ins") << " = "
+           << sat::SolutionIntegerValue(Response, UI->Ins) << "\n";
+        auto ActiveIt = IsActiveVar.find(UI);
+        if (ActiveIt != IsActiveVar.end())
+          OS << NamingScheme::nameVariable(UI->Name, "active") << " = "
+             << sat::SolutionBooleanValue(Response, ActiveIt->second)
+             << "\n";
+      }
+    }
+  }
+}
+
+void Unison::loadPreAssignments(StringRef Filename) {
+  auto BufOrErr = MemoryBuffer::getFile(Filename);
+  if (!BufOrErr) {
+    report_fatal_error(Twine("Unison: cannot open pre-assignment file: ") +
+                       Filename);
+  }
+  SmallVector<StringRef> Lines;
+  BufOrErr.get()->getBuffer().split(Lines, '\n');
+  unsigned LineNo = 0;
+  for (StringRef Line : Lines) {
+    LineNo++;
+    Line = Line.trim();
+    if (Line.empty() || Line.starts_with("#"))
+      continue;
+    auto [Name, ValStr] = Line.split('=');
+    Name = Name.trim();
+    ValStr = ValStr.trim();
+    int64_t Value;
+    if (ValStr.getAsInteger(10, Value)) {
+      errs() << "Unison: " << Filename << ":" << LineNo
+             << ": bad value '" << ValStr << "'\n";
+      continue;
+    }
+    auto Var = NS.lookupVar(Name);
+    if (!Var) {
+      errs() << "Unison: " << Filename << ":" << LineNo
+             << ": unknown variable '" << Name << "'\n";
+      continue;
+    }
+    Model.AddEquality(*Var, Value);
+  }
 }
 
 void Unison::generateCodeFromSolution() {
@@ -1923,7 +2166,11 @@ bool Unison::run() {
   copyExtend();
   addConstraints();
   addObjectiveFunction();
+  if (!UnisonPreAssign.empty())
+    loadPreAssignments(UnisonPreAssign);
   solve();
+  if (!UnisonDumpSolution.empty())
+    dumpSolution(UnisonDumpSolution);
   generateCodeFromSolution();
 
   return true;
@@ -1933,12 +2180,18 @@ bool Unison::run() {
 // Pass definition (thin wrapper)
 // ---------------------------------------------------------------------------
 
+namespace llvm {
+void initializeRegAllocUnisonPassPass(PassRegistry &);
+}
+
 namespace {
 
 class RegAllocUnisonPass : public MachineFunctionPass {
 public:
   static char ID;
-  RegAllocUnisonPass() : MachineFunctionPass(ID) {}
+  RegAllocUnisonPass() : MachineFunctionPass(ID) {
+    initializeRegAllocUnisonPassPass(*PassRegistry::getPassRegistry());
+  }
 
   StringRef getPassName() const override {
     return "Unison CP-SAT Register Allocator";
@@ -1964,6 +2217,14 @@ char RegAllocUnisonPass::ID = 0;
 
 } // end anonymous namespace
 
+INITIALIZE_PASS_BEGIN(RegAllocUnisonPass, "regallocunison",
+                      "Unison CP-SAT Register Allocator", false, false)
+INITIALIZE_PASS_DEPENDENCY(SlotIndexesWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(MachineBlockFrequencyInfoWrapperPass)
+INITIALIZE_PASS_END(RegAllocUnisonPass, "regallocunison",
+                    "Unison CP-SAT Register Allocator", false, false)
+
 static FunctionPass *createUnisonRegisterAllocator() {
   return new RegAllocUnisonPass();
 }
@@ -1971,6 +2232,13 @@ static FunctionPass *createUnisonRegisterAllocator() {
 static RegisterRegAlloc UnisonRegAlloc("unison",
                                        "Unison CP-SAT register allocator",
                                        createUnisonRegisterAllocator);
+
+// Register the pass for -run-pass=regallocunison.
+static struct ForcePassInit {
+  ForcePassInit() {
+    initializeRegAllocUnisonPassPass(*PassRegistry::getPassRegistry());
+  }
+} ForcePassInitObj;
 
 void RegAllocUnisonPass::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();

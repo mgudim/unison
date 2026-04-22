@@ -1,0 +1,29 @@
+# Test: Force a register-to-register COPY_MOVE.
+# Pre-assign a LoadMove as COPY_MOVE to generate an explicit COPY instruction.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN:   -unison-preassign=%S/codegen-move.vars %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: codegen_move:
+# CHECK:       mv
+# CHECK:       add
+# CHECK:       ret
+--- |
+  define i64 @codegen_move(i64 %a, i64 %b) {
+    %c = add i64 %a, %b
+    ret i64 %c
+  }
+...
+---
+name:            codegen_move
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10, $x11
+    %0:gpr = COPY $x10
+    %1:gpr = COPY $x11
+    %2:gpr = ADD %0, %1
+    $x10 = COPY %2
+    PseudoRET implicit $x10
+...

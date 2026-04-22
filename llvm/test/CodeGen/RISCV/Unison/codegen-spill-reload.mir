@@ -1,0 +1,34 @@
+# Test: Force a full spill-reload cycle across a call.
+# Value must be stored before the call and loaded after.
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN:   -unison-preassign=%S/codegen-spill-reload.vars %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: codegen_spill_reload:
+# CHECK:       sd {{[a-z0-9]+}}, {{[0-9]+}}(sp)
+# CHECK:       call external_func
+# CHECK:       ld {{[a-z0-9]+}}, {{[0-9]+}}(sp)
+# CHECK:       ret
+--- |
+  declare void @external_func()
+  define i64 @codegen_spill_reload(i64 %a) {
+    call void @external_func()
+    ret i64 %a
+  }
+...
+---
+name:            codegen_spill_reload
+tracksRegLiveness: true
+frameInfo:
+  adjustsStack:    true
+body:             |
+  bb.0:
+    liveins: $x10
+    %0:gpr = COPY $x10
+    ADJCALLSTACKDOWN 0, 0, implicit-def dead $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @external_func, csr_ilp32d_lp64d, implicit-def dead $x1, implicit-def $x2
+    ADJCALLSTACKUP 0, 0, implicit-def dead $x2, implicit $x2
+    $x10 = COPY %0
+    PseudoRET implicit $x10
+...

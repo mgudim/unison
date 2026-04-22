@@ -1,0 +1,34 @@
+# Test: Force value into callee-saved register across a call.
+# Value must survive the call in a callee-saved register (s0-s11).
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN:   -unison-preassign=%S/codegen-callee-save.vars %s -o - \
+# RUN:   | FileCheck %s
+
+# CHECK-LABEL: codegen_callee_save:
+# CHECK:       sd s0
+# CHECK:       call external_func
+# CHECK:       ld s0
+# CHECK:       ret
+--- |
+  declare void @external_func()
+  define i64 @codegen_callee_save(i64 %a) {
+    call void @external_func()
+    ret i64 %a
+  }
+...
+---
+name:            codegen_callee_save
+tracksRegLiveness: true
+frameInfo:
+  adjustsStack:    true
+body:             |
+  bb.0:
+    liveins: $x10
+    %0:gpr = COPY $x10
+    ADJCALLSTACKDOWN 0, 0, implicit-def dead $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @external_func, csr_ilp32d_lp64d, implicit-def dead $x1, implicit-def $x2
+    ADJCALLSTACKUP 0, 0, implicit-def dead $x2, implicit $x2
+    $x10 = COPY %0
+    PseudoRET implicit $x10
+...
