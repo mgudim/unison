@@ -536,6 +536,7 @@ private:
 
   // Cross-MBB constraints.
   void addCongruenceConstraints();
+  void addLiveInDefLinkConstraints();
 
   void addObjectiveFunction();
   void penalizeCopies(sat::LinearExpr &Objective);
@@ -768,12 +769,26 @@ void Unison::populateDefsAndUses(UnisonInstr *UInstr, MachineBasicBlock &MBB,
     } else {
       DefOp.Reg.Dom = RCDomain[A.MRI->getRegClass(Reg)];
     }
-    // Virtual register Var assigned after traversal via VRegDefClass.
 
     LocalReachingDefs[Reg] = DR;
 
-    if (Reg.isVirtual())
-      UFunc.VRegDefClass[Reg].push_back(DR);
+    if (Reg.isVirtual()) {
+      if (UInstr->K == UnisonInstr::LiveInDef) {
+        // LiveInDef gets its own variable with unified domain (register +
+        // memory) so that cross-MBB spilling works: the predecessor's
+        // LiveOutUse can propagate a memory assignment via congruence.
+        // NOT added to VRegDefClass — the shared Reg.Var only covers
+        // real instruction defs and CopyOps within a block.
+        const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
+        DefOp.Reg.Dom = RCDomain[RC].UnionWith(MemDomain);
+        DefOp.Reg.Var = Model.NewIntVar(DefOp.Reg.Dom);
+      } else {
+        // Real instruction defs and CopyOps: added to VRegDefClass
+        // to share a single Reg.Var per vreg (register-only for real
+        // defs, unified for CopyOps — resolved in assignPhysRegVarsFromEqClasses).
+        UFunc.VRegDefClass[Reg].push_back(DR);
+      }
+    }
   }
 }
 
@@ -854,10 +869,11 @@ void Unison::buildURegisterDomains() {
 
 // Opcode constants for CopyOp instruction selection.
 enum CopyOpcode : unsigned {
-  COPY_STORE = 0, // Spill to memory: def domain = memory slots.
-  COPY_MOVE = 1,  // Register-to-register move: both domains = registers.
-  COPY_LOAD = 2,  // Reload from memory: use domain = memory, def = registers.
-  COPY_REMAT = 3, // Rematerialize: recompute value instead of loading.
+  COPY_MOVE = 0,  // Register → register.
+  COPY_STORE = 1, // Register → memory.
+  COPY_LOAD = 2,  // Memory → register.
+  COPY_MEM = 3,   // Memory → memory.
+  COPY_REMAT = 4, // Rematerialize (no source read).
 };
 
 // ---------------------------------------------------------------------------
@@ -999,8 +1015,9 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
 }
 
 // For each vreg equivalence class, create one solver variable and assign
-// it to all defs of that vreg across all MBBs. This ensures LLVM's
-// one-vreg-one-physreg invariant (required by VirtRegMap / VirtRegRewriter).
+// it to all defs of that vreg (real instructions and CopyOps within blocks).
+// LiveInDef defs are excluded — they have their own variables to support
+// cross-block spilling (see addLiveInDefLinkConstraints).
 void Unison::assignPhysRegVarsFromEqClasses() {
   LLVM_DEBUG(dbgs() << "  VRegDefClass has " << UFunc.VRegDefClass.size()
                     << " vregs\n");
@@ -1008,10 +1025,8 @@ void Unison::assignPhysRegVarsFromEqClasses() {
     LLVM_DEBUG(dbgs() << "    " << printReg(Reg, A.TRI)
                       << " (" << DefOps.size() << " defs)\n");
     const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
-    // Use unified domain (registers + memory) so that cross-MBB
-    // congruence can propagate memory assignments through LiveInDef.
-    // addRegClassConstraints will restrict real instruction defs to
-    // registers only.
+    // Unified domain: real defs will be restricted to registers by
+    // addRegClassConstraints; CopyOp defs can be in memory.
     operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
     sat::IntVar PhysRegVar = Model.NewIntVar(Dom);
     VRegToPhysRegVar[Reg] = PhysRegVar;
@@ -1102,10 +1117,15 @@ void Unison::copyExtend() {
         unsigned NumRealUses = DefOp.PotentialUses.size();
 
         // --- Store-move: inserted right AFTER the def instruction ---
+        // LiveInDef StoreMoves also get COPY_MEM to handle cross-block
+        // spills where the value arrives in memory.
+        SmallVector<unsigned, 3> SMOpcodes = {COPY_MOVE, COPY_STORE};
+        if (UInstr->K == UnisonInstr::LiveInDef)
+          SMOpcodes.push_back(COPY_MEM);
         auto DefIt = InstrToIter[UInstr];
         auto AfterDef = std::next(DefIt);
         UnisonInstr *StoreMove = insertCopyOp(
-            AfterDef, {COPY_MOVE, COPY_STORE},
+            AfterDef, SMOpcodes,
             DefOp.Reg.Dom, DefOp.Reg.Dom.UnionWith(MemDomain));
         StoreMove->Uses[0].ChoiceVar = Model.NewConstant(0);
         wireDefUse(RealDR, UseRef{StoreMove, 0});
@@ -1264,6 +1284,39 @@ void Unison::addConstraints() {
     addSchedConstraints(*UMBB);
   }
   addCongruenceConstraints();
+  addLiveInDefLinkConstraints();
+}
+
+// LiveInDef defs have their own Reg.Var (unified domain) to allow
+// cross-block spilling. When a LiveInDef receives a register value
+// (not memory), it must be the SAME register as the vreg's shared
+// Reg.Var (used by real instruction defs within the block).
+void Unison::addLiveInDefLinkConstraints() {
+  for (auto &UMBB : UFunc.MBBs) {
+    for (auto &UIP : UMBB->Instrs) {
+      if (UIP->K != UnisonInstr::LiveInDef)
+        continue;
+      SmallVector<Register> DefRegs;
+      getDefsFromUnisonInstr(UIP.get(), *UMBB->MBB, DefRegs);
+      for (unsigned I = 0, E = DefRegs.size(); I < E; ++I) {
+        Register Reg = DefRegs[I];
+        if (!Reg.isVirtual())
+          continue;
+        auto It = VRegToPhysRegVar.find(Reg);
+        if (It == VRegToPhysRegVar.end())
+          continue;
+        sat::IntVar SharedVar = It->second;
+        sat::IntVar LiveInVar = UIP->getDef(I).Reg.Var;
+        // When LiveInDef is in register domain (not memory),
+        // it must match the shared vreg register.
+        sat::BoolVar InRegDomain = Model.NewBoolVar();
+        const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
+        restrictToDomain(LiveInVar, RCDomain[RC], InRegDomain);
+        restrictToDomain(LiveInVar, MemDomain, ~InRegDomain);
+        Model.AddEquality(LiveInVar, SharedVar).OnlyEnforceIf(InRegDomain);
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1384,7 +1437,7 @@ void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
       for (unsigned I = 0; I < UInstr->AltOpcodes.size(); ++I) {
         sat::BoolVar InsIsI = reifyEquality(UInstr->Ins, I);
         unsigned Opcode = UInstr->AltOpcodes[I];
-        if (Opcode == COPY_STORE)
+        if (Opcode == COPY_STORE || Opcode == COPY_MEM)
           restrictToDomain(DefOp.Reg.Var, MemDomain, InsIsI);
         else
           restrictToDomain(DefOp.Reg.Var, RegDom, InsIsI);
@@ -1414,7 +1467,7 @@ void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
             sat::BoolVar InsIsI = reifyEquality(User->Ins, I);
             sat::BoolVar Both = reifyAnd(Chosen, InsIsI);
             unsigned Opcode = User->AltOpcodes[I];
-            if (Opcode == COPY_LOAD) {
+            if (Opcode == COPY_LOAD || Opcode == COPY_MEM) {
               restrictToDomain(DefReg, MemDomain, Both);
             } else if (Opcode == COPY_STORE || Opcode == COPY_MOVE) {
               restrictToDomain(DefReg, PhysRegDomain, Both);
@@ -1691,7 +1744,8 @@ void Unison::penalizeCopies(sat::LinearExpr &Objective) {
         sat::BoolVar IsOpcChosen = reifyEquality(UInstr->Ins, I);
         sat::BoolVar ShouldIncludeInCost = reifyAnd(IsOpcChosen, Active);
 
-        if (Opcode == COPY_STORE || Opcode == COPY_LOAD) {
+        if (Opcode == COPY_STORE || Opcode == COPY_LOAD ||
+            Opcode == COPY_MEM) {
           Objective += Freq * MemOpWeight * ShouldIncludeInCost;
         } else if (Opcode == COPY_REMAT) {
           Objective += Freq * RematWeight * ShouldIncludeInCost;
@@ -1854,18 +1908,20 @@ void Unison::solve() {
 
 static StringRef copyOpcodeToName(unsigned Opcode) {
   switch (Opcode) {
-  case COPY_STORE: return "COPY_STORE";
   case COPY_MOVE:  return "COPY_MOVE";
+  case COPY_STORE: return "COPY_STORE";
   case COPY_LOAD:  return "COPY_LOAD";
+  case COPY_MEM:   return "COPY_MEM";
   case COPY_REMAT: return "COPY_REMAT";
   }
   llvm_unreachable("Unknown CopyOpcode");
 }
 
 static unsigned copyOpcodeFromName(StringRef Name) {
-  if (Name == "COPY_STORE") return COPY_STORE;
   if (Name == "COPY_MOVE")  return COPY_MOVE;
+  if (Name == "COPY_STORE") return COPY_STORE;
   if (Name == "COPY_LOAD")  return COPY_LOAD;
+  if (Name == "COPY_MEM")   return COPY_MEM;
   if (Name == "COPY_REMAT") return COPY_REMAT;
   report_fatal_error(Twine("Unknown CopyOpcode name: ") + Name);
 }
@@ -2075,6 +2131,37 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
     A.TII->loadRegFromStackSlot(*MBB, InsertPt, DstPhys,
                                 FI, RC, DstPhys);
     ++NumSpillLoads;
+    return &*std::prev(InsertPt);
+
+  } else if (Opcode == COPY_MEM) {
+    assert(SrcIdx >= NumPhysRegs && DstIdx >= NumPhysRegs);
+    if (SrcIdx == DstIdx)
+      return nullptr; // Identity: same memory slot, no instruction.
+    // Memory-to-memory copy: load to temp register, then store.
+    UnisonDefOperand &DefOp = UInstr->Defs[0];
+    const TargetRegisterClass *RC = nullptr;
+    for (auto &[RCIt, Dom] : RCDomain) {
+      if (!DefOp.Reg.Dom.IntersectionWith(Dom).IsEmpty()) {
+        RC = RCIt;
+        break;
+      }
+    }
+    assert(RC && "No register class for COPY_MEM");
+    int SrcFI = getOrCreateStackSlot(SrcIdx, RC);
+    int DstFI = getOrCreateStackSlot(DstIdx, RC);
+    MCPhysReg Scratch = 0;
+    for (MCPhysReg Reg : RC->getRawAllocationOrder(MF)) {
+      if (!A.MRI->isReserved(Reg)) {
+        Scratch = Reg;
+        break;
+      }
+    }
+    assert(Scratch && "No scratch register for COPY_MEM");
+    A.TII->loadRegFromStackSlot(*MBB, InsertPt, Scratch, SrcFI, RC, Scratch);
+    ++NumSpillLoads;
+    A.TII->storeRegToStackSlot(*MBB, InsertPt, Scratch, true, DstFI, RC,
+                               Scratch);
+    ++NumSpillStores;
     return &*std::prev(InsertPt);
 
   } else if (Opcode == COPY_REMAT) {
