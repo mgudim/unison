@@ -282,6 +282,11 @@ public:
       registerBoolVar(nameVariable(UI->Name, "active"), Active);
     }
 
+    void renameChoiceVar(UnisonInstr *UI, unsigned UseIdx, sat::IntVar Var) {
+      registerVar(nameVariable(UI->Name, "use[" + Twine(UseIdx) + "].choice"),
+                  Var);
+    }
+
     void renameDefReg(UnisonInstr *UI, unsigned DefIdx, sat::IntVar Var) {
       registerVar(nameVariable(UI->Name, "def[" + Twine(DefIdx) + "].reg"),
                   Var);
@@ -601,8 +606,11 @@ void Unison::addDefChoice(UseRef UR, DefRef DR) {
   // Add use to def's PotentialUses.
   DR.UInstr->getDef(DR.Idx).PotentialUses.push_back(UR);
   unsigned N = UseOp.PotentialDefs.size();
-  if (N > 1)
+  if (N > 1) {
     UseOp.ChoiceVar = Model.NewIntVar({0, static_cast<int64_t>(N - 1)});
+    // Re-register the ChoiceVar since it was replaced with a wider domain.
+    NS.renameChoiceVar(UR.UInstr, UR.Idx, UseOp.ChoiceVar);
+  }
 }
 
 void Unison::getMIDefsInCanonicalOrder(MachineInstr &MI,
