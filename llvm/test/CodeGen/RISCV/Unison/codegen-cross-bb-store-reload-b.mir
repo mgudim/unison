@@ -1,0 +1,33 @@
+# Test: Test: codegen-cross-bb-store-reload-b
+#
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison \
+# RUN:   -unison-preassign=%S/codegen-cross-bb-store-reload-b.vars %s -o - \
+# RUN:   | FileCheck %s
+# CHECK-LABEL: name: cross_bb_store_reload_b
+# CHECK: ADDI
+# CHECK: PseudoRET
+
+--- |
+  define i64 @cross_bb_store_reload_b(i64 %a) {
+    br label %bb1
+  bb1:
+    %b = add i64 %a, 1
+    ret i64 %b
+  }
+...
+---
+name:            cross_bb_store_reload_b
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    successors: %bb.1
+    liveins: $x10
+    %0:gpr = COPY $x10
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    %1:gpr = ADDI %0, 1
+    $x10 = COPY %1
+    PseudoRET implicit $x10
+...
