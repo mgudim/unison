@@ -39,7 +39,8 @@
 //   -unison-time-limit=N    Solver timeout per function, seconds (default 1200)
 //   -unison-num-workers=N   Solver worker threads, 0 = auto (default 0)
 //   -unison-preserve-orig-instr-order=false   Enable instruction reordering
-//   -unison-dump-model      Dump solver solution to stderr
+//   -unison-dump-solution=<file>  Dump solver solution to file
+//   -unison-preassign=<file>      Pre-assign variables from file
 //
 //
 //===----------------------------------------------------------------------===//
@@ -90,11 +91,6 @@ namespace sat = operations_research::sat;
 
 STATISTIC(NumSpillStores, "Number of spill stores inserted");
 STATISTIC(NumSpillLoads, "Number of spill loads inserted");
-
-static cl::opt<bool> UnisonDumpModel(
-    "unison-dump-model",
-    cl::desc("Dump CP-SAT model to debug output"),
-    cl::Hidden);
 
 static cl::opt<int> UnisonTimeLimitPerInstr(
     "unison-time-per-instr",
@@ -1799,10 +1795,6 @@ void Unison::addObjectiveFunction() {
 }
 
 void Unison::solve() {
-  if (UnisonDumpModel)
-    dbgs() << "# Unison model for: " << MF.getName() << "\n"
-           << Model.Proto().DebugString();
-
   // Validate model before solving.
   {
     std::string err = operations_research::sat::ValidateCpModel(Model.Proto());
@@ -1998,49 +1990,6 @@ void Unison::generateCodeFromSolution() {
   removeInactiveInstructions();
   sortByIssueCycle();
 
-  // Dump solution for debugging non-determinism issues.
-  if (UnisonDumpModel) {
-    const auto &Response = SolverResponse;
-    errs() << "=== Solution for " << MF.getName() << " ===\n";
-    for (auto &UMBB : UFunc.MBBs) {
-      errs() << "MBB#" << UMBB->MBB->getNumber() << ":\n";
-      for (auto &UIP : UMBB->Instrs) {
-        int64_t IC = sat::SolutionIntegerValue(Response, UIP->IssueCycle);
-        const char *K = UIP->K == UnisonInstr::LiveInDef ? "LI" :
-                        UIP->K == UnisonInstr::LiveOutUse ? "LO" :
-                        UIP->K == UnisonInstr::RealInstr ? "RI" : "CO";
-        errs() << "  IC=" << IC << " " << K
-               << " [" << UIP->Name << "]";
-        if (UIP->isCopyOp()) {
-          int64_t InsV = sat::SolutionIntegerValue(Response, UIP->Ins);
-          unsigned Opc = UIP->AltOpcodes[static_cast<unsigned>(InsV)];
-          const char *OpcStr = Opc == 0 ? "ST" : Opc == 1 ? "MV" :
-                               Opc == 2 ? "LD" : "RM";
-          errs() << "(" << OpcStr << ")";
-        }
-        for (unsigned D = 0; D < UIP->Defs.size(); ++D) {
-          int64_t Idx = sat::SolutionIntegerValue(Response,
-                            UIP->Defs[D].Reg.Var);
-          errs() << " d" << D << "=" << Idx;
-        }
-        for (unsigned U = 0; U < UIP->Uses.size(); ++U) {
-          UnisonUseOperand &UseOp = UIP->Uses[U];
-          int64_t Ch = sat::SolutionIntegerValue(Response, UseOp.ChoiceVar);
-          DefRef DR = UseOp.PotentialDefs[static_cast<unsigned>(Ch)];
-          int64_t SrcIdx = sat::SolutionIntegerValue(Response,
-                               DR.UInstr->getDef(DR.Idx).Reg.Var);
-          errs() << " u" << U << "=" << SrcIdx
-                 << "(ch" << Ch << " " << DR.UInstr->Name
-                 << ".d" << DR.Idx << ")";
-        }
-        if (UIP->RealMI)
-          errs() << "  " << *UIP->RealMI;
-        else
-          errs() << "\n";
-      }
-    }
-  }
-
   generateInstructions();
 }
 
@@ -2142,10 +2091,9 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
     assert(SrcIdx < NumPhysRegs && DstIdx < NumPhysRegs);
     MCRegister SrcPhys = IdxToMCReg[static_cast<int>(SrcIdx)];
     MCRegister DstPhys = IdxToMCReg[static_cast<int>(DstIdx)];
-    if (UnisonDumpModel)
-      errs() << "  COPY_MOVE: " << printReg(SrcPhys, A.TRI) << " -> "
-             << printReg(DstPhys, A.TRI)
-             << (SrcPhys == DstPhys ? " (identity, skip)\n" : "\n");
+    LLVM_DEBUG(dbgs() << "  COPY_MOVE: " << printReg(SrcPhys, A.TRI) << " -> "
+                      << printReg(DstPhys, A.TRI)
+                      << (SrcPhys == DstPhys ? " (identity, skip)\n" : "\n"));
     if (SrcPhys == DstPhys)
       return nullptr;
 
