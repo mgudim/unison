@@ -253,6 +253,7 @@ public:
   class NamingScheme {
     bool BuildMap;
     StringMap<sat::IntVar> VarByName;
+    StringMap<UnisonInstr *> InstrByName;
 
     void registerVar(StringRef Name, sat::IntVar Var) {
       Var.WithName(Name.str());
@@ -290,10 +291,17 @@ public:
                   Var);
     }
 
-    std::optional<sat::IntVar> lookupVar(StringRef Name) const {
+    std::optional<sat::IntVar> getVariableByName(StringRef Name) const {
       auto It = VarByName.find(Name);
       if (It == VarByName.end())
         return std::nullopt;
+      return It->second;
+    }
+
+    UnisonInstr *getInstrByName(StringRef Name) const {
+      auto It = InstrByName.find(Name);
+      if (It == InstrByName.end())
+        return nullptr;
       return It->second;
     }
   };
@@ -425,9 +433,8 @@ private:
   SchedModelKind SchedKind = SchedModelKind::TwoSlot;
 
   // --- Helpers ---
-  // Create a UnisonInstr and append it to Dest. Returns a raw pointer.
-  UnisonInstr *createUnisonInstr(
-      std::list<std::unique_ptr<UnisonInstr>> &Dest,
+  // Create a UnisonInstr. Returns a unique_ptr; caller handles insertion.
+  static std::unique_ptr<UnisonInstr> createUnisonInstr(
       UnisonInstr::Kind K, MachineInstr *RealMI = nullptr);
 
   // Wire a def to a use (bidirectional: adds to both PotentialUses and
@@ -544,6 +551,8 @@ private:
   void solve();
   void dumpSolution(StringRef Filename);
   void loadPreAssignments(StringRef Filename);
+  int64_t getInsVarValueFromName(StringRef VarName, StringRef ValStr);
+  int64_t getChoiceVarValueFromName(StringRef VarName, StringRef ValStr);
   void generateCodeFromSolution();
 
   // --- Code generation phases ---
@@ -569,15 +578,12 @@ private:
 // Unison implementation
 // ---------------------------------------------------------------------------
 
-Unison::UnisonInstr *Unison::createUnisonInstr(
-    std::list<std::unique_ptr<UnisonInstr>> &Dest,
+std::unique_ptr<Unison::UnisonInstr> Unison::createUnisonInstr(
     UnisonInstr::Kind K, MachineInstr *RealMI) {
   auto UInstr = std::make_unique<UnisonInstr>();
   UInstr->K = K;
   UInstr->RealMI = RealMI;
-  UnisonInstr *Ptr = UInstr.get();
-  Dest.push_back(std::move(UInstr));
-  return Ptr;
+  return UInstr;
 }
 
 // createCopyOp removed — CopyOps are now created inline in copyExtend
@@ -876,7 +882,7 @@ void Unison::NamingScheme::nameInstruction(UnisonInstr *UI,
     assert(!UI->Uses.empty() && !UI->Uses[0].PotentialDefs.empty());
     DefRef ParentDR = UI->Uses[0].PotentialDefs[0];
 
-    bool IsStoreMove = UI->AltOpcodes[0] == COPY_STORE;
+    bool IsStoreMove = llvm::is_contained(UI->AltOpcodes, COPY_STORE);
     if (IsStoreMove) {
       UI->Name = ParentDR.UInstr->Name;
       UI->Name += ".d";
@@ -897,6 +903,8 @@ void Unison::NamingScheme::nameInstruction(UnisonInstr *UI,
     break;
   }
   }
+  if (BuildMap)
+    InstrByName[UI->Name] = UI;
 }
 
 void Unison::NamingScheme::nameAllVariablesInInstruction(UnisonInstr *UI) {
@@ -944,7 +952,9 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
     SmallString<16> MBBPrefix("MBB");
     MBBPrefix += Twine(MBB->getNumber()).str();
     auto addUnisonInstr = [&](UnisonInstr::Kind K, MachineInstr *RealMI) {
-      UnisonInstr *UInstr = createUnisonInstr(UMBB->Instrs, K, RealMI);
+      auto UInstrOwner = createUnisonInstr(K, RealMI);
+      UnisonInstr *UInstr = UInstrOwner.get();
+      UMBB->Instrs.push_back(std::move(UInstrOwner));
       NS.nameInstruction(UInstr, MBBPrefix, RICount);
       if (K == UnisonInstr::RealInstr)
         RICount++;
@@ -1091,7 +1101,7 @@ void Unison::copyExtend() {
         auto DefIt = InstrToIter[UInstr];
         auto AfterDef = std::next(DefIt);
         UnisonInstr *StoreMove = insertCopyOp(
-            AfterDef, {COPY_STORE, COPY_MOVE},
+            AfterDef, {COPY_MOVE, COPY_STORE},
             DefOp.Reg.Dom, DefOp.Reg.Dom.UnionWith(MemDomain));
         StoreMove->Uses[0].ChoiceVar = Model.NewConstant(0);
         wireDefUse(RealDR, UseRef{StoreMove, 0});
@@ -1105,7 +1115,7 @@ void Unison::copyExtend() {
         for (unsigned UI = 0; UI < NumRealUses; ++UI) {
           UseRef RealUR = DefOp.PotentialUses[UI];
 
-          SmallVector<unsigned, 3> LoadOpcodes = {COPY_LOAD, COPY_MOVE};
+          SmallVector<unsigned, 3> LoadOpcodes = {COPY_MOVE, COPY_LOAD};
           if (CanRemat)
             LoadOpcodes.push_back(COPY_REMAT);
 
@@ -1842,6 +1852,24 @@ void Unison::solve() {
   SolverResponse = Response;
 }
 
+static StringRef copyOpcodeToName(unsigned Opcode) {
+  switch (Opcode) {
+  case COPY_STORE: return "COPY_STORE";
+  case COPY_MOVE:  return "COPY_MOVE";
+  case COPY_LOAD:  return "COPY_LOAD";
+  case COPY_REMAT: return "COPY_REMAT";
+  }
+  llvm_unreachable("Unknown CopyOpcode");
+}
+
+static unsigned copyOpcodeFromName(StringRef Name) {
+  if (Name == "COPY_STORE") return COPY_STORE;
+  if (Name == "COPY_MOVE")  return COPY_MOVE;
+  if (Name == "COPY_LOAD")  return COPY_LOAD;
+  if (Name == "COPY_REMAT") return COPY_REMAT;
+  report_fatal_error(Twine("Unknown CopyOpcode name: ") + Name);
+}
+
 void Unison::dumpSolution(StringRef Filename) {
   std::error_code EC;
   raw_fd_ostream OS(Filename, EC);
@@ -1856,6 +1884,23 @@ void Unison::dumpSolution(StringRef Filename) {
     OS << "# MBB#" << UMBB->MBB->getNumber() << "\n";
     for (auto &UIP : UMBB->Instrs) {
       UnisonInstr *UI = UIP.get();
+
+      // Skip inactive CopyOps — their variable values are don't-cares
+      // and can conflict with constraints if fixed during pre-assignment.
+      if (UI->isCopyOp()) {
+        auto ActiveIt = IsActiveVar.find(UI);
+        bool IsActive = ActiveIt != IsActiveVar.end() &&
+                        sat::SolutionBooleanValue(Response, ActiveIt->second);
+        OS << NamingScheme::nameVariable(UI->Name, "active") << " = "
+           << IsActive << "\n";
+        if (!IsActive)
+          continue;
+        int64_t InsVal = sat::SolutionIntegerValue(Response, UI->Ins);
+        OS << NamingScheme::nameVariable(UI->Name, "ins") << " = "
+           << copyOpcodeToName(UI->AltOpcodes[static_cast<unsigned>(InsVal)])
+           << "\n";
+      }
+
       OS << NamingScheme::nameVariable(UI->Name, "ic") << " = "
          << sat::SolutionIntegerValue(Response, UI->IssueCycle) << "\n";
       for (unsigned I = 0; I < UI->Defs.size(); I++)
@@ -1863,22 +1908,51 @@ void Unison::dumpSolution(StringRef Filename) {
                "def[" + Twine(I) + "].reg") << " = "
            << sat::SolutionIntegerValue(Response, UI->Defs[I].Reg.Var)
            << "\n";
-      for (unsigned I = 0; I < UI->Uses.size(); I++)
+      for (unsigned I = 0; I < UI->Uses.size(); I++) {
+        int64_t Ch = sat::SolutionIntegerValue(Response,
+                         UI->Uses[I].ChoiceVar);
+        StringRef ChoiceName = UI->Uses[I]
+            .PotentialDefs[static_cast<unsigned>(Ch)].UInstr->Name;
         OS << NamingScheme::nameVariable(UI->Name,
                "use[" + Twine(I) + "].choice") << " = "
-           << sat::SolutionIntegerValue(Response, UI->Uses[I].ChoiceVar)
-           << "\n";
-      if (UI->isCopyOp()) {
-        OS << NamingScheme::nameVariable(UI->Name, "ins") << " = "
-           << sat::SolutionIntegerValue(Response, UI->Ins) << "\n";
-        auto ActiveIt = IsActiveVar.find(UI);
-        if (ActiveIt != IsActiveVar.end())
-          OS << NamingScheme::nameVariable(UI->Name, "active") << " = "
-             << sat::SolutionBooleanValue(Response, ActiveIt->second)
-             << "\n";
+           << ChoiceName << "\n";
       }
     }
   }
+}
+
+// Resolve symbolic ins value (e.g. "COPY_STORE") to its index in AltOpcodes.
+int64_t Unison::getInsVarValueFromName(StringRef VarName, StringRef ValStr) {
+  unsigned Opc = copyOpcodeFromName(ValStr);
+  UnisonInstr *UI = NS.getInstrByName(VarName.drop_back(4)); // remove ".ins"
+  if (!UI)
+    report_fatal_error(Twine("Unknown instruction in ins variable: ") + VarName);
+  for (unsigned I = 0; I < UI->AltOpcodes.size(); I++)
+    if (UI->AltOpcodes[I] == Opc)
+      return I;
+  report_fatal_error(Twine("Opcode ") + ValStr +
+                     " not in AltOpcodes of " + UI->Name);
+}
+
+// Resolve symbolic choice value (instruction name) to its index in PotentialDefs.
+int64_t Unison::getChoiceVarValueFromName(StringRef VarName, StringRef ValStr) {
+  size_t UsePos = VarName.rfind(".use[");
+  if (UsePos == StringRef::npos)
+    report_fatal_error(Twine("Malformed choice variable name: ") + VarName);
+  UnisonInstr *UI = NS.getInstrByName(VarName.take_front(UsePos));
+  if (!UI)
+    report_fatal_error(Twine("Unknown instruction in choice variable: ") +
+                       VarName);
+  StringRef UseIdxStr = VarName.slice(UsePos + 5, VarName.rfind(']'));
+  unsigned UseIdx;
+  if (UseIdxStr.getAsInteger(10, UseIdx) || UseIdx >= UI->Uses.size())
+    report_fatal_error(Twine("Bad use index in: ") + VarName);
+  auto &PotDefs = UI->Uses[UseIdx].PotentialDefs;
+  for (unsigned I = 0; I < PotDefs.size(); I++)
+    if (PotDefs[I].UInstr->Name == ValStr)
+      return I;
+  report_fatal_error(Twine("Choice '") + ValStr +
+                     "' not in PotentialDefs of " + VarName);
 }
 
 void Unison::loadPreAssignments(StringRef Filename) {
@@ -1898,18 +1972,24 @@ void Unison::loadPreAssignments(StringRef Filename) {
     auto [Name, ValStr] = Line.split('=');
     Name = Name.trim();
     ValStr = ValStr.trim();
+
+    // Try numeric value first, then symbolic resolution.
     int64_t Value;
     if (ValStr.getAsInteger(10, Value)) {
-      errs() << "Unison: " << Filename << ":" << LineNo
-             << ": bad value '" << ValStr << "'\n";
-      continue;
+      if (Name.ends_with(".ins"))
+        Value = getInsVarValueFromName(Name, ValStr);
+      else if (Name.ends_with("].choice"))
+        Value = getChoiceVarValueFromName(Name, ValStr);
+      else
+        report_fatal_error(Twine("Non-numeric value '") + ValStr +
+                           "' for variable '" + Name + "' at " +
+                           Filename + ":" + Twine(LineNo));
     }
-    auto Var = NS.lookupVar(Name);
-    if (!Var) {
-      errs() << "Unison: " << Filename << ":" << LineNo
-             << ": unknown variable '" << Name << "'\n";
-      continue;
-    }
+
+    auto Var = NS.getVariableByName(Name);
+    if (!Var)
+      report_fatal_error(Twine("Unknown variable '") + Name + "' at " +
+                         Filename + ":" + Twine(LineNo));
     Model.AddEquality(*Var, Value);
   }
 }

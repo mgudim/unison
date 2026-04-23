@@ -9,8 +9,8 @@
 
 # CHECK-LABEL: name: swap_physregs
 # CHECK: $x12 = COPY $x10
-# CHECK: ADJCALLSTACKDOWN
 # CHECK: $x10 = COPY $x11
+# CHECK: ADJCALLSTACKDOWN
 # CHECK: $x11 = COPY $x12
 # CHECK: PseudoCALL target-flags(riscv-call) @callee
 # CHECK: ADJCALLSTACKUP
