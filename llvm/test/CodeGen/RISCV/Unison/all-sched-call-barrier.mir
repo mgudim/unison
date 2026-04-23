@@ -3,19 +3,19 @@
 # Instructions after the call must stay after it.
 # Pure instructions within each region can be freely reordered.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison \
 # RUN:   -unison-preserve-orig-instr-order=false %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: sched_call_barrier:                     # @sched_call_barrier
-# CHECK:       addi	sp, sp, -16
-# CHECK:       sd	ra, 8(sp)                       # 8-byte Folded Spill
-# CHECK:       call	external_func
-# CHECK:       li	a2, 7
-# CHECK:       sd	a2, 0(zero)
-# CHECK:       ld	ra, 8(sp)                       # 8-byte Folded Reload
-# CHECK:       addi	sp, sp, 16
-# CHECK:       ret
+# CHECK-LABEL: name: sched_call_barrier
+# CHECK: $x10 = ADDI $x0, 42
+# CHECK: $x11 = ADDI $x0, 99
+# CHECK: ADJCALLSTACKDOWN
+# CHECK: PseudoCALL target-flags(riscv-call) @external_func
+# CHECK: ADJCALLSTACKUP
+# CHECK: $x12 = ADDI $x0, 7
+# CHECK: SD $x12, $x0, 0
+# CHECK: PseudoRET
 --- |
   declare void @external_func()
   define void @sched_call_barrier() {

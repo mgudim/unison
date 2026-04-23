@@ -5,18 +5,19 @@
 #
 #   region1: [ADDI, ADDI] → store1 → region2: [ADDI] → store2 → region3: [ADDI] → store3
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison \
 # RUN:   -unison-preserve-orig-instr-order=false %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: sched_multi_barrier:                    # @sched_multi_barrier
-# CHECK:       li	a1, 1
-# CHECK:       li	a3, 3
-# CHECK:       li	a4, 4
-# CHECK:       sd	a1, 0(a0)
-# CHECK:       sd	a3, 8(a0)
-# CHECK:       sd	a4, 16(a0)
-# CHECK:       ret
+# CHECK-LABEL: name: sched_multi_barrier
+# CHECK: $x11 = ADDI $x0, 1
+# CHECK: $x12 = ADDI $x0, 2
+# CHECK: SD $x11, $x10, 0
+# CHECK: $x13 = ADDI $x0, 3
+# CHECK: SD $x13, $x10, 8
+# CHECK: $x14 = ADDI $x0, 4
+# CHECK: SD $x14, $x10, 16
+# CHECK: PseudoRET
 --- |
   define void @sched_multi_barrier() {
     ret void

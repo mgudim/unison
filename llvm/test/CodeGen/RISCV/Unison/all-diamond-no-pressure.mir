@@ -9,11 +9,18 @@
 #   \ /
 #   bb.3 (exit)
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: diamond_no_pressure:                    # @diamond_no_pressure
-# CHECK:       ret
+# CHECK-LABEL: name: diamond_no_pressure
+# CHECK: bb.0:
+# CHECK: BNE $x11, $x0, %bb.2
+# CHECK: bb.1:
+# CHECK: PseudoBR %bb.3
+# CHECK: bb.2:
+# CHECK: PseudoBR %bb.3
+# CHECK: bb.3:
+# CHECK: PseudoRET implicit $x10
 --- |
   define i64 @diamond_no_pressure(i64 %val, i1 %cond) {
   entry:

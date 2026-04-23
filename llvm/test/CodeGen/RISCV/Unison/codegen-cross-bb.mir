@@ -1,14 +1,17 @@
 # Test: Value live across basic blocks — must pass through in the same register.
 # Pre-assign to verify congruence constraint works.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison \
 # RUN:   -unison-preassign=%S/codegen-cross-bb.vars %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: codegen_cross_bb:
-# CHECK:       bnez
-# CHECK:       li a0, 0
-# CHECK:       ret
+# CHECK-LABEL: name: codegen_cross_bb
+# CHECK: BLT $x0, $x10, %bb.1
+# CHECK: bb.1:
+# CHECK: PseudoRET implicit $x10
+# CHECK: bb.2:
+# CHECK: $x10 = ADDI $x0, 0
+# CHECK: PseudoRET implicit $x10
 --- |
   define i64 @codegen_cross_bb(i64 %a) {
   entry:

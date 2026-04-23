@@ -8,73 +8,15 @@
 #
 # Expected: %0 starts in $x12, gets copied to $x13 between regions.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: copy_between_regions:                   # @copy_between_regions
-# CHECK:       addi	sp, sp, -16
-# CHECK:       sd	s0, 8(sp)                       # 8-byte Folded Spill
-# CHECK:       mv	s0, a0
-# CHECK:       li	a0, 1
-# CHECK:       li	a1, 2
-# CHECK:       li	a3, 4
-# CHECK:       li	a4, 5
-# CHECK:       li	a5, 6
-# CHECK:       li	a6, 7
-# CHECK:       li	a7, 8
-# CHECK:       li	t0, 9
-# CHECK:       li	t1, 10
-# CHECK:       li	t2, 11
-# CHECK:       li	t3, 12
-# CHECK:       li	t4, 13
-# CHECK:       li	t5, 14
-# CHECK:       li	t6, 15
-# CHECK:       li	a2, 23
-# CHECK:       sd	a0, 0(zero)
-# CHECK:       sd	a1, 8(zero)
-# CHECK:       sd	a3, 16(zero)
-# CHECK:       sd	a4, 24(zero)
-# CHECK:       sd	a5, 32(zero)
-# CHECK:       sd	a6, 40(zero)
-# CHECK:       sd	a7, 48(zero)
-# CHECK:       sd	t0, 56(zero)
-# CHECK:       sd	t1, 64(zero)
-# CHECK:       sd	t2, 72(zero)
-# CHECK:       sd	t3, 80(zero)
-# CHECK:       sd	t4, 88(zero)
-# CHECK:       sd	t5, 96(zero)
-# CHECK:       sd	t6, 104(zero)
-# CHECK:       li	a0, 21
-# CHECK:       li	a1, 22
-# CHECK:       li	a4, 25
-# CHECK:       li	a5, 26
-# CHECK:       li	a6, 27
-# CHECK:       li	a7, 28
-# CHECK:       li	t0, 29
-# CHECK:       li	t1, 30
-# CHECK:       li	t2, 31
-# CHECK:       li	t3, 32
-# CHECK:       li	t4, 33
-# CHECK:       li	t5, 34
-# CHECK:       li	t6, 35
-# CHECK:       sd	a0, 0(zero)
-# CHECK:       sd	a1, 8(zero)
-# CHECK:       sd	a2, 16(zero)
-# CHECK:       sd	a4, 24(zero)
-# CHECK:       sd	a5, 32(zero)
-# CHECK:       sd	a6, 40(zero)
-# CHECK:       sd	a7, 48(zero)
-# CHECK:       sd	t0, 56(zero)
-# CHECK:       sd	t1, 64(zero)
-# CHECK:       sd	t2, 72(zero)
-# CHECK:       sd	t3, 80(zero)
-# CHECK:       sd	t4, 88(zero)
-# CHECK:       sd	t5, 96(zero)
-# CHECK:       sd	t6, 104(zero)
-# CHECK:       mv	a0, s0
-# CHECK:       ld	s0, 8(sp)                       # 8-byte Folded Reload
-# CHECK:       addi	sp, sp, 16
-# CHECK:       ret
+# CHECK-LABEL: name: copy_between_regions
+# CHECK: $x8 = COPY $x10
+# CHECK: $x10 = ADDI $x0, 1
+# CHECK: SD $x10, $x0, 0
+# CHECK: $x10 = COPY $x8
+# CHECK: PseudoRET
 --- |
   define i64 @copy_between_regions(i64 %val) {
     ret i64 %val

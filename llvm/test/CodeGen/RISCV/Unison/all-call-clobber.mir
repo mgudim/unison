@@ -4,20 +4,15 @@
 # Expected: %0 assigned to a callee-saved register, or saved/restored
 # around the call via CopyOps.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: call_clobber:                           # @call_clobber
-# CHECK:       addi	sp, sp, -16
-# CHECK:       sd	ra, 8(sp)                       # 8-byte Folded Spill
-# CHECK:       sd	s0, 0(sp)                       # 8-byte Folded Spill
-# CHECK:       mv	s0, a0
-# CHECK:       call	external_func
-# CHECK:       mv	a0, s0
-# CHECK:       ld	ra, 8(sp)                       # 8-byte Folded Reload
-# CHECK:       ld	s0, 0(sp)                       # 8-byte Folded Reload
-# CHECK:       addi	sp, sp, 16
-# CHECK:       ret
+# CHECK-LABEL: name: call_clobber
+# CHECK: ADJCALLSTACKDOWN
+# CHECK: PseudoCALL target-flags(riscv-call) @external_func
+# CHECK: ADJCALLSTACKUP
+# CHECK: $x10 = COPY
+# CHECK: PseudoRET
 --- |
   declare void @external_func()
   define i64 @call_clobber(i64 %val) {

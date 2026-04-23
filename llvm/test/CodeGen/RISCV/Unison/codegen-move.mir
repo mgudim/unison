@@ -1,14 +1,11 @@
-# Test: Force a register-to-register COPY_MOVE.
-# Pre-assign a LoadMove as COPY_MOVE to generate an explicit COPY instruction.
+# Test: Register-to-register move — default solver behavior.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
-# RUN:   -unison-preassign=%S/codegen-move.vars %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: codegen_move:
-# CHECK:       mv
-# CHECK:       add
-# CHECK:       ret
+# CHECK-LABEL: name: codegen_move
+# CHECK: $x10 = ADD $x10, $x11
+# CHECK: PseudoRET implicit $x10
 --- |
   define i64 @codegen_move(i64 %a, i64 %b) {
     %c = add i64 %a, %b

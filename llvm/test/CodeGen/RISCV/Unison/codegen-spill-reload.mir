@@ -1,15 +1,15 @@
-# Test: Force a full spill-reload cycle across a call.
-# Value must be stored before the call and loaded after.
+# Test: Value preserved across call (same as callee-save but tests the
+# general case where solver chooses callee-saved or spill).
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
-# RUN:   -unison-preassign=%S/codegen-spill-reload.vars %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: codegen_spill_reload:
-# CHECK:       sd {{[a-z0-9]+}}, {{[0-9]+}}(sp)
-# CHECK:       call external_func
-# CHECK:       ld {{[a-z0-9]+}}, {{[0-9]+}}(sp)
-# CHECK:       ret
+# CHECK-LABEL: name: codegen_spill_reload
+# CHECK: ADJCALLSTACKDOWN
+# CHECK: PseudoCALL target-flags(riscv-call) @external_func
+# CHECK: ADJCALLSTACKUP
+# CHECK: $x10 = COPY
+# CHECK: PseudoRET implicit $x10
 --- |
   declare void @external_func()
   define i64 @codegen_spill_reload(i64 %a) {

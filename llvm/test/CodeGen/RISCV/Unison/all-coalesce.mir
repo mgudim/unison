@@ -3,13 +3,12 @@
 # the COPY becomes an identity and is eliminated.
 # Expected: %0 coalesced to $x10, no COPY in output.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: coalesce:                               # @coalesce
-# CHECK:       addi	a1, a0, 1
-# CHECK:       mv	a0, a1
-# CHECK:       ret
+# CHECK-LABEL: name: coalesce
+# CHECK: $x10 = ADDI $x10, 1
+# CHECK: PseudoRET implicit $x10
 --- |
   define i64 @coalesce(i64 %a) {
     %r = add i64 %a, 1

@@ -3,18 +3,18 @@
 # The solver is free to schedule them in any order.
 # The makespan objective should still produce a valid schedule.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison \
 # RUN:   -unison-preserve-orig-instr-order=false %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: sched_pure_reorder:                     # @sched_pure_reorder
-# CHECK:       li	a0, 1
-# CHECK:       li	a1, 2
-# CHECK:       li	a2, 3
-# CHECK:       sd	a0, 0(zero)
-# CHECK:       sd	a1, 8(zero)
-# CHECK:       sd	a2, 16(zero)
-# CHECK:       ret
+# CHECK-LABEL: name: sched_pure_reorder
+# CHECK: $x10 = ADDI $x0, 1
+# CHECK: $x11 = ADDI $x0, 2
+# CHECK: $x12 = ADDI $x0, 3
+# CHECK: SD $x10, $x0, 0
+# CHECK: SD $x11, $x0, 8
+# CHECK: SD $x12, $x0, 16
+# CHECK: PseudoRET
 --- |
   define void @sched_pure_reorder() {
     ret void

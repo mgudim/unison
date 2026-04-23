@@ -1,14 +1,15 @@
 # Test: Force a spill — StoreMove saves to stack, LoadMove reloads.
 # Two vregs, force one to spill even though registers are available.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison \
 # RUN:   -unison-preassign=%S/codegen-spill.vars %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: codegen_spill:
-# CHECK:       sd {{[a-z0-9]+}}, {{[0-9]+}}(sp)
-# CHECK:       ld {{[a-z0-9]+}}, {{[0-9]+}}(sp)
-# CHECK:       ret
+# CHECK-LABEL: name: codegen_spill
+# CHECK: SD killed $x11, %stack.0, 0
+# CHECK: ${{[a-z0-9]+}} = LD %stack.0, 0
+# CHECK: $x10 = ADD $x10
+# CHECK: PseudoRET implicit $x10
 --- |
   define signext i64 @codegen_spill(i64 signext %a, i64 signext %b) {
     %c = add i64 %a, %b

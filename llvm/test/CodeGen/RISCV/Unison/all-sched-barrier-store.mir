@@ -6,16 +6,17 @@
 # With preserve-order off, the solver can reorder pure instructions
 # within a barrier-free region but cannot move them across barriers.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison \
 # RUN:   -unison-preserve-orig-instr-order=false %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: sched_barrier_store:                    # @sched_barrier_store
-# CHECK:       li	a1, 1
-# CHECK:       li	a3, 3
-# CHECK:       sd	a1, 0(a0)
-# CHECK:       sd	a3, 8(a0)
-# CHECK:       ret
+# CHECK-LABEL: name: sched_barrier_store
+# CHECK: $x11 = ADDI $x0, 1
+# CHECK: $x12 = ADDI $x0, 2
+# CHECK: SD $x11, $x10, 0
+# CHECK: $x13 = ADDI $x0, 3
+# CHECK: SD $x13, $x10, 8
+# CHECK: PseudoRET
 --- |
   define void @sched_barrier_store() {
     ret void

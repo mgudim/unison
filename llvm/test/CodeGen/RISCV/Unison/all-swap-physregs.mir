@@ -4,20 +4,17 @@
 # call needs it in $x11, and vice versa.
 # The solver must insert a register copy to resolve the swap.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: swap_physregs:                          # @swap_physregs
-# CHECK:       addi	sp, sp, -16
-# CHECK:       sd	ra, 8(sp)                       # 8-byte Folded Spill
-# CHECK:       mv	a2, a0
-# CHECK:       mv	a3, a1
-# CHECK:       mv	a0, a3
-# CHECK:       mv	a1, a2
-# CHECK:       call	callee
-# CHECK:       ld	ra, 8(sp)                       # 8-byte Folded Reload
-# CHECK:       addi	sp, sp, 16
-# CHECK:       ret
+# CHECK-LABEL: name: swap_physregs
+# CHECK: $x12 = COPY $x10
+# CHECK: ADJCALLSTACKDOWN
+# CHECK: $x10 = COPY $x11
+# CHECK: $x11 = COPY $x12
+# CHECK: PseudoCALL target-flags(riscv-call) @callee
+# CHECK: ADJCALLSTACKUP
+# CHECK: PseudoRET
 --- |
   declare i64 @callee(i64, i64)
   define i64 @swap_physregs(i64 %a, i64 %b) {

@@ -4,47 +4,15 @@
 #
 # Expected: %0 in a callee-saved register with prologue/epilogue save/restore.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: forced_spill:                           # @forced_spill
-# CHECK:       addi	sp, sp, -16
-# CHECK:       sd	s0, 8(sp)                       # 8-byte Folded Spill
-# CHECK:       mv	s0, a0
-# CHECK:       li	a0, 1
-# CHECK:       li	a1, 2
-# CHECK:       li	a2, 3
-# CHECK:       li	a3, 4
-# CHECK:       li	a4, 5
-# CHECK:       li	a5, 6
-# CHECK:       li	a6, 7
-# CHECK:       li	a7, 8
-# CHECK:       li	t0, 9
-# CHECK:       li	t1, 10
-# CHECK:       li	t2, 11
-# CHECK:       li	t3, 12
-# CHECK:       li	t4, 13
-# CHECK:       li	t5, 14
-# CHECK:       li	t6, 15
-# CHECK:       sd	a0, 0(zero)
-# CHECK:       sd	a1, 8(zero)
-# CHECK:       sd	a2, 16(zero)
-# CHECK:       sd	a3, 24(zero)
-# CHECK:       sd	a4, 32(zero)
-# CHECK:       sd	a5, 40(zero)
-# CHECK:       sd	a6, 48(zero)
-# CHECK:       sd	a7, 56(zero)
-# CHECK:       sd	t0, 64(zero)
-# CHECK:       sd	t1, 72(zero)
-# CHECK:       sd	t2, 80(zero)
-# CHECK:       sd	t3, 88(zero)
-# CHECK:       sd	t4, 96(zero)
-# CHECK:       sd	t5, 104(zero)
-# CHECK:       sd	t6, 112(zero)
-# CHECK:       mv	a0, s0
-# CHECK:       ld	s0, 8(sp)                       # 8-byte Folded Reload
-# CHECK:       addi	sp, sp, 16
-# CHECK:       ret
+# CHECK-LABEL: name: forced_spill
+# CHECK: $x8 = COPY $x10
+# CHECK: $x10 = ADDI $x0, 1
+# CHECK: SD $x10, $x0, 0
+# CHECK: $x10 = COPY $x8
+# CHECK: PseudoRET
 --- |
   define i64 @forced_spill(i64 %val) {
     ret i64 %val

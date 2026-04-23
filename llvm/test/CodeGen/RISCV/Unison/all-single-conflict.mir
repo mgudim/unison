@@ -3,15 +3,16 @@
 # The vreg must be assigned to a register other than $x10.
 # Expected: %0 avoids $x10, no spills needed.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: single_conflict:                        # @single_conflict
-# CHECK:       mv	a1, a0
-# CHECK:       lui	a0, %hi(g)
-# CHECK:       sd	zero, %lo(g)(a0)
-# CHECK:       sd	a1, %lo(g)(a0)
-# CHECK:       ret
+# CHECK-LABEL: name: single_conflict
+# CHECK: $x11 = COPY $x10
+# CHECK: $x10 = LUI target-flags(riscv-hi) @g
+# CHECK: SD $x0, $x10, target-flags(riscv-lo) @g
+# CHECK: $x10 = LUI target-flags(riscv-hi) @g
+# CHECK: SD $x11, $x10, target-flags(riscv-lo) @g
+# CHECK: PseudoRET
 --- |
   @g = global i64 0
   define void @single_conflict(i64 %a) {

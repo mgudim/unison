@@ -3,17 +3,14 @@
 # to different physical registers.
 # Expected: %0 and %1 in different registers, no spills.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison %s -o - \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: two_vregs_compete:                      # @two_vregs_compete
-# CHECK:       mv	a2, a0
-# CHECK:       mv	a3, a1
-# CHECK:       add	a1, a2, a3
-# CHECK:       sub	a4, a2, a3
-# CHECK:       add	a2, a1, a4
-# CHECK:       mv	a0, a2
-# CHECK:       ret
+# CHECK-LABEL: name: two_vregs_compete
+# CHECK: $x12 = ADD $x10, $x11
+# CHECK: $x10 = SUB $x10, $x11
+# CHECK: $x10 = ADD $x12, $x10
+# CHECK: PseudoRET
 --- |
   define i64 @two_vregs_compete(i64 %a, i64 %b) {
     %sum = add i64 %a, %b

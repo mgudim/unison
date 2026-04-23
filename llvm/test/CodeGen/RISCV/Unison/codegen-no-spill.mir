@@ -1,13 +1,13 @@
 # Test: No-spill code generation — force all CopyOps inactive.
 # A single ADDW with two physreg inputs. No register pressure.
 #
-# RUN: llc -mtriple=riscv64 -load %libunison -regalloc=unison \
+# RUN: llc -mtriple=riscv64 -load %libunison -run-pass=regallocunison \
 # RUN:   -unison-preassign=%S/codegen-no-spill.vars %s -o - \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: codegen_no_spill:
-# CHECK:       addw a0, a0, a1
-# CHECK-NEXT:  ret
+# CHECK-LABEL: name: codegen_no_spill
+# CHECK: $x10 = ADDW $x10, $x11
+# CHECK: PseudoRET implicit $x10
 --- |
   define signext i32 @codegen_no_spill(i32 signext %a, i32 signext %b) {
     %c = add i32 %a, %b
