@@ -964,10 +964,6 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
 
     // Create a UnisonInstr, assign its issue cycle, and analyze defs/uses.
     // All ICs are solver variables. LiveInDef is anchored at 0.
-    // When UnisonPreserveOrder is set, consecutive real instructions are
-    // chained with AddLessThan to preserve program order while still
-    // letting the solver space them apart for CopyOps.
-    UnisonInstr *PrevRealInstr = nullptr;
     unsigned RICount = 0;
     SmallString<16> MBBPrefix("MBB");
     MBBPrefix += Twine(MBB->getNumber()).str();
@@ -983,12 +979,6 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
       } else {
         UInstr->IssueCycle = Model.NewIntVar(
             operations_research::Domain(0, UB));
-      }
-      if (K == UnisonInstr::RealInstr && UnisonPreserveOrder) {
-        UnisonInstr *Prev = PrevRealInstr ? PrevRealInstr
-                                          : UMBB->Instrs.front().get();
-        Model.AddLessThan(Prev->IssueCycle, UInstr->IssueCycle);
-        PrevRealInstr = UInstr;
       }
       populateDefsAndUses(UInstr, *MBB, LocalReachingDefs);
       NS.nameAllVariablesInInstruction(UInstr);
@@ -1560,6 +1550,20 @@ void Unison::deriveActivationVars(UnisonMBB &UMBB) {
 // ---------------------------------------------------------------------------
 
 void Unison::addSchedConstraints(UnisonMBB &UMBB) {
+  // When UnisonPreserveOrder is set, chain consecutive real instructions
+  // in program order to preserve the original schedule.
+  if (UnisonPreserveOrder) {
+    UnisonInstr *Prev = nullptr;
+    for (auto &UIP : UMBB.Instrs) {
+      if (UIP->K != UnisonInstr::RealInstr)
+        continue;
+      UnisonInstr *Cur = UIP.get();
+      if (!Prev)
+        Prev = UMBB.Instrs.front().get(); // LiveInDef
+      Model.AddLessThan(Prev->IssueCycle, Cur->IssueCycle);
+      Prev = Cur;
+    }
+  }
   addDataDependencyConstraints(UMBB);
   addAntiDependencyConstraints(UMBB);
   addOrderingConstraints(UMBB);
