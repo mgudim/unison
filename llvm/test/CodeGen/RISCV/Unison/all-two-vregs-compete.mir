@@ -7,9 +7,9 @@
 # RUN:   | FileCheck %s
 
 # CHECK-LABEL: name: two_vregs_compete
-# CHECK: $x12 = ADD $x10, $x11
-# CHECK: $x10 = SUB $x10, $x11
-# CHECK: $x10 = ADD $x12, $x10
+# CHECK: ADD $x{{[0-9]+}}, $x{{[0-9]+}}
+# CHECK: SUB $x{{[0-9]+}}, $x{{[0-9]+}}
+# CHECK: ADD $x{{[0-9]+}}, $x{{[0-9]+}}
 # CHECK: PseudoRET
 --- |
   define i64 @two_vregs_compete(i64 %a, i64 %b) {

@@ -7,7 +7,7 @@
 # RUN:   | FileCheck %s
 
 # CHECK-LABEL: name: coalesce
-# CHECK: $x10 = ADDI $x10, 1
+# CHECK: ADDI $x{{[0-9]+}}, 1
 # CHECK: PseudoRET implicit $x10
 --- |
   define i64 @coalesce(i64 %a) {

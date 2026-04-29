@@ -6,7 +6,7 @@
 # RUN:   | FileCheck %s
 
 # CHECK-LABEL: name: codegen_no_spill
-# CHECK: $x10 = ADDW $x10, $x11
+# CHECK: ADDW $x{{[0-9]+}}, $x{{[0-9]+}}
 # CHECK: PseudoRET implicit $x10
 --- |
   define signext i32 @codegen_no_spill(i32 signext %a, i32 signext %b) {

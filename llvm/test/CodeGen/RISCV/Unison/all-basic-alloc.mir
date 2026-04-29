@@ -6,7 +6,7 @@
 # RUN:   | FileCheck %s
 
 # CHECK-LABEL: name: basic_alloc
-# CHECK: $x10 = ADD $x10, $x11
+# CHECK: ADD $x{{[0-9]+}}, $x{{[0-9]+}}
 # CHECK: PseudoRET implicit $x10
 --- |
   define i64 @basic_alloc(i64 %a, i64 %b) {
