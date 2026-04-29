@@ -771,29 +771,20 @@ bool Unison::isLocal(UnisonInstr *UI, MachineBasicBlock &MBB) const {
   if (UI->K == UnisonInstr::LiveInDef || UI->K == UnisonInstr::LiveOutUse)
     return false;
 
-  // CopyOp: trace back to the original real def's register.
-  // The CopyOp's use (Uses[0]) connects to a def chain; if ANY vreg
-  // in that chain is cross-block, this CopyOp is non-local.
+  // CopyOp: check output and input sides.
+  // Recursion is bounded — CopyOp chains are at most 2 deep (SM → LM).
   if (UI->isCopyOp()) {
-    // Walk from the CopyOp's use to its potential source defs.
-    for (UnisonDef *SrcDef : UI->Uses[0]->PotentialDefs) {
-      // Find the original real instruction def by walking up CopyOp chains.
-      UnisonDef *D = SrcDef;
-      while (D->Parent->isCopyOp() && !D->Parent->Uses.empty())
-        D = D->Parent->Uses[0]->PotentialDefs[0];
-      // Check all registers in the original defining instruction.
-      SmallVector<Register> DefRegs;
-      getDefsFromUnisonInstr(D->Parent, MBB, DefRegs);
-      for (Register Reg : DefRegs)
-        if (Reg.isVirtual() && CrossBlockVRegs.contains(Reg))
-          return false;
-    }
-    // Also check the CopyOp's own def destination.
-    // (Its def may feed into a cross-block use.)
+    // Output: if any def feeds into LiveOutUse → non-local.
     for (UnisonDef *D : UI->Defs)
       for (UnisonUse *U : D->PotentialUses)
         if (U->Parent->K == UnisonInstr::LiveOutUse)
           return false;
+
+    // Input: if any source def's parent is non-local → non-local.
+    for (UnisonDef *SrcDef : UI->Uses[0]->PotentialDefs)
+      if (!isLocal(SrcDef->Parent, MBB))
+        return false;
+
     return true;
   }
 
