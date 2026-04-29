@@ -1405,9 +1405,19 @@ void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
     UnisonInstr *UInstr = UInstrPtr.get();
 
     // --- Def-side constraints ---
-    // RealInstr defs: domain already set at variable creation (createVariables).
-    // CopyOp defs: restrict based on instruction alternative.
-    if (UInstr->isCopyOp()) {
+    // RealInstr defs: restrict to register class + memory domain.
+    if (UInstr->K == UnisonInstr::RealInstr) {
+      SmallVector<Register> DefRegs;
+      getDefsFromUnisonInstr(UInstr, *UMBB.MBB, DefRegs);
+      for (unsigned DI = 0; DI < UInstr->Defs.size() && DI < DefRegs.size(); ++DI) {
+        Register Reg = DefRegs[DI];
+        if (Reg.isVirtual()) {
+          const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
+          restrictToDomain(getRegVar(UInstr->Defs[DI], Model),
+                           RCDomain[RC].UnionWith(MemDomain));
+        }
+      }
+    } else if (UInstr->isCopyOp()) {
       UnisonDef *DefOp = UInstr->Defs[0];
       sat::IntVar DefReg = getRegVar(DefOp, Model);
 
