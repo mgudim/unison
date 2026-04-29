@@ -154,13 +154,14 @@ static cl::opt<bool> UnisonPreserveOrder(
 class Unison {
 public:
   class UnisonInstr;
+  class UnisonUse;
 
   // A def operand. Pure IR node — no solver variables.
   // Allocated from UnisonFunction::OperandAlloc for pointer stability.
   class UnisonDef {
   public:
     UnisonInstr *Parent = nullptr;
-    SmallVector<class UnisonUse *, 4> PotentialUses;
+    SmallVector<UnisonUse *, 4> PotentialUses;
   };
 
   // A use operand. Pure IR node — no solver variables.
@@ -397,7 +398,7 @@ private:
     if (It != DChosenInUMap.end())
       return It->second;
     unsigned DefIdx = DefIdxInUseMap.lookup(Key);
-    sat::BoolVar B = reifyEquality(M, getChoiceVar(U, M), DefIdx);
+    sat::BoolVar B = reifyEquality(getChoiceVar(U, M), DefIdx);
     DChosenInUMap[Key] = B;
     return B;
   }
@@ -920,7 +921,6 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
     // we encounter a use, this tells us which specific def it reads from.
     DenseMap<Register, UnisonDef *> LocalReachingDefs;
     UMBB->IssueCycleUpperBound = getIssueCycleUpperBound(*MBB);
-    int UB = UMBB->IssueCycleUpperBound;
 
     // Create a UnisonInstr and analyze defs/uses.
     // No solver variables — those are created in a separate pass.
@@ -1071,8 +1071,6 @@ void Unison::copyExtend() {
     return;
 
   for (auto &UMBB : UFunc.MBBs) {
-    int UB = UMBB->IssueCycleUpperBound;
-
     // Build UnisonInstr* → list iterator map for in-place insertion.
     DenseMap<UnisonInstr *, std::list<std::unique_ptr<UnisonInstr>>::iterator>
         InstrToIter;
@@ -1287,7 +1285,7 @@ void Unison::addLiveInDefLinkConstraints() {
         if (It == VRegToPhysRegVar.end())
           continue;
         sat::IntVar SharedVar = It->second;
-        sat::IntVar LiveInVar = UIP->getDef(I).Reg.Var;
+        sat::IntVar LiveInVar = getRegVar(UIP->Defs[I], Model);
         // When LiveInDef is in register domain (not memory),
         // it must match the shared vreg register.
         sat::BoolVar InRegDomain = Model.NewBoolVar();
@@ -1327,10 +1325,10 @@ sat::IntVar Unison::getDefLastUseCycle(UnisonInstr *UInstr,
   // used at U (DActiveInU). Inactive uses contribute the definer's IC
   // (so that the rectangle always has at least size 1).
   std::vector<sat::IntVar> UseCycleVars;
-  for (const UseRef &UR : DefOp->PotentialUses) {
+  for (UnisonUse *U : DefOp->PotentialUses) {
     sat::IntVar UseCycle = Model.NewIntVar({0, IssueCycleUB});
-    sat::BoolVar Active = getDActiveInU(UInstr->Defs[DefIdx], UR);
-    Model.AddEquality(UseCycle, UR.getICVar(UInstr, Model)).OnlyEnforceIf(Active);
+    sat::BoolVar Active = getDActiveInU(Model, UInstr->Defs[DefIdx], U);
+    Model.AddEquality(UseCycle, getICVar(U->Parent, Model)).OnlyEnforceIf(Active);
     Model.AddEquality(UseCycle, getICVar(UInstr, Model)).OnlyEnforceIf(~Active);
     UseCycleVars.push_back(UseCycle);
   }
@@ -1371,7 +1369,7 @@ void Unison::addNoOverlapConstraints(UnisonMBB &UMBB) {
       sat::IntVar TimeSize = Model.NewIntVar({1, UB + 2});
       Model.AddEquality(TimeSize, TimeEnd - TimeStart);
 
-      addRectangle(UMBB, UInstr, DefOp.Reg.Var, TimeStart, TimeSize, TimeEnd);
+      addRectangle(UMBB, UInstr, getRegVar(DefOp, Model), TimeStart, TimeSize, TimeEnd);
     }
   }
 }
@@ -1407,21 +1405,19 @@ void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
     UnisonInstr *UInstr = UInstrPtr.get();
 
     // --- Def-side constraints ---
-    if (UInstr->K == UnisonInstr::RealInstr) {
-      for (UnisonDef *DefOp : UInstr->Defs)
-        restrictToDomain(DefOp.Reg.Var, DefOp.Reg.Dom);
-    } else if (UInstr->isCopyOp()) {
+    // RealInstr defs: domain already set at variable creation (createVariables).
+    // CopyOp defs: restrict based on instruction alternative.
+    if (UInstr->isCopyOp()) {
       UnisonDef *DefOp = UInstr->Defs[0];
-      operations_research::Domain RegDom =
-          DefOp.Reg.Dom.IntersectionWith(PhysRegDomain);
+      sat::IntVar DefReg = getRegVar(DefOp, Model);
 
       for (unsigned I = 0; I < UInstr->AltOpcodes.size(); ++I) {
         sat::BoolVar InsIsI = reifyEquality(getInsVar(UInstr, Model), I);
         unsigned Opcode = UInstr->AltOpcodes[I];
         if (Opcode == COPY_STORE || Opcode == COPY_MEM)
-          restrictToDomain(DefOp.Reg.Var, MemDomain, InsIsI);
+          restrictToDomain(DefReg, MemDomain, InsIsI);
         else
-          restrictToDomain(DefOp.Reg.Var, RegDom, InsIsI);
+          restrictToDomain(DefReg, PhysRegDomain, InsIsI);
       }
     }
 
@@ -1432,11 +1428,11 @@ void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
     // A LiveOutUse has no restriction (synthetic, can accept register or memory).
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
       UnisonDef *DefOp = UInstr->Defs[DI];
-      sat::IntVar DefReg = DefOp.Reg.Var;
+      sat::IntVar DefReg = getRegVar(DefOp, Model);
 
-      for (const UseRef &UR : DefOp->PotentialUses) {
-        UnisonInstr *User = UR.UInstr;
-        sat::BoolVar Chosen = getDChosenInU(UInstr->Defs[DI], UR);
+      for (UnisonUse *U : DefOp->PotentialUses) {
+        UnisonInstr *User = U->Parent;
+        sat::BoolVar Chosen = getDChosenInU(Model, UInstr->Defs[DI], U);
 
         if (User->K == UnisonInstr::RealInstr) {
           // Real instructions read from registers only.
@@ -1445,7 +1441,7 @@ void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
         } else if (User->isCopyOp()) {
           // CopyOp source requirement depends on instruction alternative.
           for (unsigned I = 0; I < User->AltOpcodes.size(); ++I) {
-            sat::BoolVar InsIsI = reifyEquality(User->Ins, I);
+            sat::BoolVar InsIsI = reifyEquality(getInsVar(User, Model), I);
             sat::BoolVar Both = reifyAnd(Chosen, InsIsI);
             unsigned Opcode = User->AltOpcodes[I];
             if (Opcode == COPY_LOAD || Opcode == COPY_MEM) {
@@ -1473,16 +1469,15 @@ sat::BoolVar Unison::deriveDefActivation(UnisonInstr *UInstr, unsigned DI) {
 
   SmallVector<sat::BoolVar, 4> ActiveBools;
 
-  for (const UseRef &UR : DefOp->PotentialUses) {
-    UnisonUse *UseOp = UR.UInstr->getUse(UR.Idx);
-    bool SingleChoice = (UseOp->PotentialDefs.size() == 1);
-    bool UseAlwaysActive = UR.UInstr->isAlwaysActive();
+  for (UnisonUse *U : DefOp->PotentialUses) {
+    bool SingleChoice = (U->PotentialDefs.size() == 1);
+    bool UseAlwaysActive = U->Parent->isAlwaysActive();
 
     // Short-circuit: unconditionally chosen + always-active use.
     if (SingleChoice && UseAlwaysActive)
       return Model.TrueVar();
 
-    ActiveBools.push_back(getDActiveInU(UInstr->Defs[DI], UR));
+    ActiveBools.push_back(getDActiveInU(Model, UInstr->Defs[DI], U));
   }
 
   if (ActiveBools.empty())
@@ -1571,9 +1566,9 @@ void Unison::addDataDependencyConstraints(UnisonMBB &UMBB) {
   for (auto &UInstrPtr : UMBB.Instrs) {
     UnisonInstr *UInstr = UInstrPtr.get();
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
-      for (const UseRef &UR : UInstr->Defs[DI]->PotentialUses) {
-        sat::BoolVar Chosen = getDChosenInU(UInstr->Defs[DI], UR);
-        Model.AddGreaterOrEqual(UR.getICVar(UInstr, Model),
+      for (UnisonUse *U : UInstr->Defs[DI]->PotentialUses) {
+        sat::BoolVar Chosen = getDChosenInU(Model, UInstr->Defs[DI], U);
+        Model.AddGreaterOrEqual(getICVar(U->Parent, Model),
                                 getICVar(UInstr, Model) + Latency)
             .OnlyEnforceIf(Chosen);
       }
@@ -1599,14 +1594,14 @@ void Unison::addAntiDependencyConstraints(UnisonMBB &UMBB) {
 
     // First: check defs against prior readers (anti-dependency).
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
-      int VarIdx = UInstr->Defs[DI]->Reg.Var.index();
+      int VarIdx = getRegVar(UInstr->Defs[DI], Model).index();
       auto It = ReadersOfVar.find(VarIdx);
       if (It != ReadersOfVar.end()) {
         for (UnisonInstr *Reader : It->second) {
           if (Reader == UInstr)
             continue;
-          // TODO: only add antidependency if both insturctions are active.
-          Model.AddLessOrEqual(Reader->IssueCycle, getICVar(UInstr, Model));
+          // TODO: only add antidependency if both instructions are active.
+          Model.AddLessOrEqual(getICVar(Reader, Model), getICVar(UInstr, Model));
         }
       }
     }
@@ -1617,8 +1612,8 @@ void Unison::addAntiDependencyConstraints(UnisonMBB &UMBB) {
     // potential source variables.
     for (unsigned UI = 0; UI < UInstr->Uses.size(); ++UI) {
       UnisonUse *UseOp = UInstr->Uses[UI];
-      for (auto &DR : UseOp->PotentialDefs) {
-        int VarIdx = DR.UInstr->getDef(DR.Idx).Reg.Var.index();
+      for (UnisonDef *SrcDef : UseOp->PotentialDefs) {
+        int VarIdx = getRegVar(SrcDef, Model).index();
         ReadersOfVar[VarIdx].push_back(UInstr);
       }
     }
@@ -1701,9 +1696,9 @@ sat::BoolVar Unison::getIsNotIdentityCopy(UnisonInstr *UInstr) {
   // TODO: what if copy has several defs feeding into it?
   UnisonUse *UseOp = UInstr->Uses[0];
   assert(!UseOp->PotentialDefs.empty());
-  DefRef SrcDR = UseOp->PotentialDefs[0];
-  return reifyNotEqual(SrcDR.UInstr->getDef(SrcDR.Idx).Reg.Var,
-                       UInstr->Defs[0]->Reg.Var);
+  UnisonDef *SrcDef = UseOp->PotentialDefs[0];
+  return reifyNotEqual(getRegVar(SrcDef, Model),
+                       getRegVar(UInstr->Defs[0], Model));
 }
 
 void Unison::penalizeCopies(sat::LinearExpr &Objective) {
@@ -1836,7 +1831,7 @@ void Unison::addMinimizeMakespanObjective(sat::LinearExpr &Objective) {
         MaxFreq);
     for (auto &UInstrPtr : UMBB->Instrs) {
       if (UInstrPtr->K == UnisonInstr::LiveOutUse)
-        Objective += Freq * UInstrPtr->IssueCycle;
+        Objective += Freq * getICVar(UInstrPtr.get(), Model);
     }
   }
 }
@@ -1957,13 +1952,13 @@ void Unison::dumpSolution(StringRef Filename) {
       for (unsigned I = 0; I < UI->Defs.size(); I++)
         OS << NamingScheme::nameVariable(UI->Name,
                "def[" + Twine(I) + "].reg") << " = "
-           << sat::SolutionIntegerValue(Response, UI->Defs[I]->Reg.Var)
+           << sat::SolutionIntegerValue(Response, getRegVar(UI->Defs[I], Model))
            << "\n";
       for (unsigned I = 0; I < UI->Uses.size(); I++) {
         int64_t Ch = sat::SolutionIntegerValue(Response,
-                         UI->Uses[I]->ChoiceVar);
+                         getChoiceVar(UI->Uses[I], Model));
         StringRef ChoiceName = UI->Uses[I]
-            .PotentialDefs[static_cast<unsigned>(Ch)].UInstr->Name;
+            ->PotentialDefs[static_cast<unsigned>(Ch)]->Parent->Name;
         OS << NamingScheme::nameVariable(UI->Name,
                "use[" + Twine(I) + "].choice") << " = "
            << ChoiceName << "\n";
@@ -1998,9 +1993,9 @@ int64_t Unison::getChoiceVarValueFromName(StringRef VarName, StringRef ValStr) {
   unsigned UseIdx;
   if (UseIdxStr.getAsInteger(10, UseIdx) || UseIdx >= UI->Uses.size())
     report_fatal_error(Twine("Bad use index in: ") + VarName);
-  auto &PotDefs = UI->Uses[UseIdx].PotentialDefs;
+  auto &PotDefs = UI->Uses[UseIdx]->PotentialDefs;
   for (unsigned I = 0; I < PotDefs.size(); I++)
-    if (PotDefs[I].UInstr->Name == ValStr)
+    if (PotDefs[I]->Parent->Name == ValStr)
       return I;
   report_fatal_error(Twine("Choice '") + ValStr +
                      "' not in PotentialDefs of " + VarName);
@@ -2072,8 +2067,8 @@ void Unison::sortByIssueCycle() {
     UMBB->Instrs.sort(
         [&](const std::unique_ptr<UnisonInstr> &A,
             const std::unique_ptr<UnisonInstr> &B) {
-          int64_t ICA = sat::SolutionIntegerValue(Response, A->IssueCycle);
-          int64_t ICB = sat::SolutionIntegerValue(Response, B->IssueCycle);
+          int64_t ICA = sat::SolutionIntegerValue(Response, getICVar(A.get(), Model));
+          int64_t ICB = sat::SolutionIntegerValue(Response, getICVar(B.get(), Model));
           return ICA < ICB;
         });
   }
@@ -2086,12 +2081,12 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
   int64_t InsVal = sat::SolutionIntegerValue(Response, getInsVar(UInstr, Model));
   unsigned Opcode = UInstr->AltOpcodes[static_cast<unsigned>(InsVal)];
   int64_t DstIdx = sat::SolutionIntegerValue(Response,
-                                              UInstr->Defs[0]->Reg.Var);
+                                              getRegVar(UInstr->Defs[0], Model));
   UnisonUse *UseOp = UInstr->Uses[0];
   int64_t Choice = sat::SolutionIntegerValue(Response, getChoiceVar(UseOp, Model));
-  DefRef SrcDR = UseOp->PotentialDefs[static_cast<unsigned>(Choice)];
+  UnisonDef *SrcDef = UseOp->PotentialDefs[static_cast<unsigned>(Choice)];
   int64_t SrcIdx = sat::SolutionIntegerValue(Response,
-                       SrcDR.UInstr->getDef(SrcDR.Idx).Reg.Var);
+                       getRegVar(SrcDef, Model));
 
   // Get or create a stack slot for a memory index from the solver.
   auto getOrCreateStackSlot = [&](int64_t MemIdx,
@@ -2133,10 +2128,11 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
     if (SrcIdx == DstIdx)
       return nullptr; // Identity: same memory slot, no instruction.
     // Memory-to-memory copy: load to temp register, then store.
-    UnisonDef *DefOp = UInstr->Defs[0];
+    // Find a register class for the scratch register. Use the first
+    // RC that overlaps with the physical register domain.
     const TargetRegisterClass *RC = nullptr;
     for (auto &[RCIt, Dom] : RCDomain) {
-      if (!DefOp.Reg.Dom.IntersectionWith(Dom).IsEmpty()) {
+      if (!Dom.IsEmpty()) {
         RC = RCIt;
         break;
       }
@@ -2203,18 +2199,18 @@ void Unison::generateInstructions() {
     MachineInstr *MI = UI->RealMI;
     assert(MI);
 
-    // Rewrite defs: each def's Reg.Var gives the physreg.
+    // Rewrite defs: each def's RegVar gives the physreg.
     SmallVector<CanonicalOperand, 8> CanonDefs;
     getMIDefsInCanonicalOrder(*MI, CanonDefs);
     for (unsigned I = 0; I < UI->Defs.size() && I < CanonDefs.size(); ++I) {
       if (!CanonDefs[I].MO || CanonDefs[I].Reg.isPhysical())
         continue;
-      int64_t Idx = sat::SolutionIntegerValue(Response, UI->Defs[I]->Reg.Var);
+      int64_t Idx = sat::SolutionIntegerValue(Response, getRegVar(UI->Defs[I], Model));
       if (Idx < NumPhysRegs)
         CanonDefs[I].MO->setReg(IdxToMCReg[static_cast<int>(Idx)]);
     }
 
-    // Rewrite uses: each use's chosen def's Reg.Var gives the physreg.
+    // Rewrite uses: each use's chosen def's RegVar gives the physreg.
     // Both virtual AND physical register uses are rewritten — a CopyOp
     // may redirect a physical register use to a different register.
     SmallVector<CanonicalOperand, 8> CanonUses;
@@ -2224,9 +2220,9 @@ void Unison::generateInstructions() {
         continue;
       UnisonUse *UseOp = UI->Uses[I];
       int64_t Choice = sat::SolutionIntegerValue(Response, getChoiceVar(UseOp, Model));
-      DefRef DR = UseOp->PotentialDefs[static_cast<unsigned>(Choice)];
+      UnisonDef *ChosenDef = UseOp->PotentialDefs[static_cast<unsigned>(Choice)];
       int64_t Idx = sat::SolutionIntegerValue(Response,
-                        DR.UInstr->getDef(DR.Idx).Reg.Var);
+                        getRegVar(ChosenDef, Model));
       if (Idx < NumPhysRegs)
         CanonUses[I].MO->setReg(IdxToMCReg[static_cast<int>(Idx)]);
     }
@@ -2249,7 +2245,7 @@ void Unison::generateInstructions() {
         continue;
       for (unsigned I = 0; I < UIP->Defs.size(); ++I) {
         int64_t Idx = sat::SolutionIntegerValue(Response,
-                          UIP->Defs[I]->Reg.Var);
+                          getRegVar(UIP->Defs[I], Model));
         if (Idx < NumPhysRegs)
           MBB->addLiveIn(IdxToMCReg[static_cast<int>(Idx)]);
       }
