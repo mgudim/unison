@@ -341,7 +341,14 @@ private:
   Analyses &A;
   MachineFunction &MF;
 
-  // CP-SAT model (one per function).
+  // Global model: cross-block vreg assignments, congruence, interference.
+  sat::CpModelBuilder GlobalModel;
+  // Per-MBB local models: scheduling, local allocation, NoOverlap2D.
+  // Indexed by position in UFunc.MBBs.
+  SmallVector<sat::CpModelBuilder> LocalModels;
+
+  // Legacy monolithic model — used during transition. Will be removed
+  // once the global/local solving loop is fully wired.
   sat::CpModelBuilder Model;
 
   // --- Register/memory index space ---
@@ -514,6 +521,9 @@ private:
 
   // --- Pipeline stages ---
   void buildUnisonInstructionsAndAnalyzeDefs();
+  // Create solver variables for a single instruction in the given model.
+  void createVariablesForInstr(UnisonInstr *UI, UnisonMBB &UMBB,
+                               sat::CpModelBuilder &M);
   void assignPhysRegVarsFromEqClasses();
   void copyExtend();
   // Create solver variables for all instructions in the given model.
@@ -1060,69 +1070,65 @@ void Unison::assignPhysRegVarsFromEqClasses() {
   }
 }
 
+void Unison::createVariablesForInstr(UnisonInstr *UI, UnisonMBB &UMBB,
+                                     sat::CpModelBuilder &M) {
+  int UB = UMBB.IssueCycleUpperBound;
+
+  // Issue cycle.
+  if (UI->K == UnisonInstr::LiveInDef)
+    ICVars[UI].push_back({&M, M.NewConstant(0)});
+  else
+    ICVars[UI].push_back({&M, M.NewIntVar({0, UB})});
+
+  // Defs: RegVar. Skip defs already assigned via assignPhysRegVarsFromEqClasses.
+  SmallVector<Register> DefRegs;
+  getDefsFromUnisonInstr(UI, *UMBB.MBB, DefRegs);
+  for (unsigned I = 0; I < UI->Defs.size(); I++) {
+    UnisonDef *D = UI->Defs[I];
+    // Already has a variable in this model (from assignPhysRegVarsFromEqClasses)?
+    bool Found = false;
+    for (auto &[Mdl, Var] : RegVars[D])
+      if (Mdl == &M) { Found = true; break; }
+    if (Found)
+      continue;
+
+    Register Reg = I < DefRegs.size() ? DefRegs[I] : Register();
+    if (Reg.isValid() && Reg.isPhysical()) {
+      RegVars[D].push_back({&M, M.NewConstant(MCRegToIdx[MCRegister(Reg)])});
+    } else if (Reg.isValid() && Reg.isVirtual()) {
+      const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
+      operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
+      RegVars[D].push_back({&M, M.NewIntVar(Dom)});
+    } else {
+      // CopyOp def without a known register — unified domain.
+      RegVars[D].push_back({&M, M.NewIntVar(RegMemDomain)});
+    }
+  }
+
+  // Uses: ChoiceVar.
+  for (UnisonUse *U : UI->Uses) {
+    unsigned N = U->PotentialDefs.size();
+    sat::IntVar CV = (N <= 1)
+        ? M.NewConstant(0)
+        : M.NewIntVar({0, static_cast<int64_t>(N - 1)});
+    ChoiceVars[U].push_back({&M, CV});
+  }
+
+  // CopyOp: Ins variable.
+  if (UI->isCopyOp()) {
+    unsigned N = UI->AltOpcodes.size();
+    sat::IntVar IV = (N == 1)
+        ? M.NewConstant(0)
+        : M.NewIntVar({0, static_cast<int64_t>(N - 1)});
+    InsVars[UI].push_back({&M, IV});
+  }
+}
+
 void Unison::createVariables(sat::CpModelBuilder &M) {
-  // For each instruction, create IC, Ins, Reg, and Choice variables
-  // in the given model and register them in the VarEntry maps.
   for (auto &UMBB : UFunc.MBBs) {
-    int UB = UMBB->IssueCycleUpperBound;
     for (auto &UIP : UMBB->Instrs) {
-      UnisonInstr *UI = UIP.get();
-
-      // Issue cycle.
-      if (UI->K == UnisonInstr::LiveInDef)
-        ICVars[UI].push_back({&M, M.NewConstant(0)});
-      else
-        ICVars[UI].push_back({&M, M.NewIntVar({0, UB})});
-
-      // Defs: RegVar. Skip defs already assigned via assignPhysRegVarsFromEqClasses.
-      SmallVector<Register> DefRegs;
-      getDefsFromUnisonInstr(UI, *UMBB->MBB, DefRegs);
-      for (unsigned I = 0; I < UI->Defs.size(); I++) {
-        UnisonDef *D = UI->Defs[I];
-        // Already has a variable in this model (from assignPhysRegVarsFromEqClasses)?
-        bool Found = false;
-        for (auto &[Model, Var] : RegVars[D])
-          if (Model == &M) { Found = true; break; }
-        if (Found)
-          continue;
-
-        Register Reg = I < DefRegs.size() ? DefRegs[I] : Register();
-        if (Reg.isValid() && Reg.isPhysical()) {
-          RegVars[D].push_back({&M, M.NewConstant(MCRegToIdx[MCRegister(Reg)])});
-        } else if (Reg.isValid() && Reg.isVirtual()) {
-          // LiveInDef gets unified domain (register + memory).
-          const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
-          operations_research::Domain Dom =
-              (UI->K == UnisonInstr::LiveInDef)
-                  ? RCDomain[RC].UnionWith(MemDomain)
-                  : RCDomain[RC].UnionWith(MemDomain);
-          RegVars[D].push_back({&M, M.NewIntVar(Dom)});
-        } else {
-          // CopyOp def without a known register — unified domain.
-          RegVars[D].push_back({&M, M.NewIntVar(RegMemDomain)});
-        }
-      }
-
-      // Uses: ChoiceVar.
-      for (UnisonUse *U : UI->Uses) {
-        unsigned N = U->PotentialDefs.size();
-        sat::IntVar CV = (N <= 1)
-            ? M.NewConstant(0)
-            : M.NewIntVar({0, static_cast<int64_t>(N - 1)});
-        ChoiceVars[U].push_back({&M, CV});
-      }
-
-      // CopyOp: Ins variable.
-      if (UI->isCopyOp()) {
-        unsigned N = UI->AltOpcodes.size();
-        sat::IntVar IV = (N == 1)
-            ? M.NewConstant(0)
-            : M.NewIntVar({0, static_cast<int64_t>(N - 1)});
-        InsVars[UI].push_back({&M, IV});
-      }
-
-      // Name all variables for this instruction.
-      nameAllVariablesInInstruction(UI, M);
+      createVariablesForInstr(UIP.get(), *UMBB, M);
+      nameAllVariablesInInstruction(UIP.get(), M);
     }
   }
 }
@@ -2385,7 +2391,26 @@ bool Unison::run() {
     }
   });
 
-  createVariables(Model);                    // create all solver vars in Model
+  // Initialize per-MBB local models.
+  LocalModels.resize(UFunc.MBBs.size());
+
+  // Create variables in GlobalModel and per-MBB LocalModels.
+  // Non-local instructions get variables in both their LocalModel and GlobalModel.
+  // Local instructions get variables only in their LocalModel.
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+    UnisonMBB &UMBB = *UFunc.MBBs[MBBIdx];
+    sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+    for (auto &UIP : UMBB.Instrs) {
+      UnisonInstr *UI = UIP.get();
+      createVariablesForInstr(UI, UMBB, LM);
+      if (!isLocal(UI, *UMBB.MBB))
+        createVariablesForInstr(UI, UMBB, GlobalModel);
+    }
+  }
+
+  // Also create variables in the monolithic model (legacy path).
+  createVariables(Model);
+
   addConstraints();
   addObjectiveFunction();
   if (!UnisonPreAssign.empty())
