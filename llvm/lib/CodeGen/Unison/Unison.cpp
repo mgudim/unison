@@ -252,6 +252,9 @@ public:
     StringMap<sat::IntVar> VarByName;
     StringMap<UnisonInstr *> InstrByName;
 
+  public:
+    NamingScheme(bool BuildMap = false) : BuildMap(BuildMap) {}
+
     void registerVar(StringRef Name, sat::IntVar Var) {
       Var.WithName(Name.str());
       if (BuildMap)
@@ -264,9 +267,6 @@ public:
         VarByName[Name] = sat::IntVar(Var);
     }
 
-  public:
-    NamingScheme(bool BuildMap = false) : BuildMap(BuildMap) {}
-
     static SmallString<32> nameVariable(StringRef InstrName,
                                         const Twine &VarSuffix) {
       SmallString<32> Result(InstrName);
@@ -277,7 +277,6 @@ public:
 
     void nameInstruction(UnisonInstr *UI, StringRef MBBPrefix,
                          unsigned InstrIdx);
-    void nameAllVariablesInInstruction(UnisonInstr *UI);
 
     void nameActiveVar(UnisonInstr *UI, sat::BoolVar Active) {
       registerBoolVar(nameVariable(UI->Name, "active"), Active);
@@ -498,6 +497,10 @@ private:
   void buildURegisterDomains();
 
   NamingScheme NS;
+
+  // Name all solver variables for a UnisonInstr in the given model.
+  // Must be called after createVariables().
+  void nameAllVariablesInInstruction(UnisonInstr *UI, sat::CpModelBuilder &M);
 
   // --- Pipeline stages ---
   void buildUnisonInstructionsAndAnalyzeDefs();
@@ -897,10 +900,28 @@ void Unison::NamingScheme::nameInstruction(UnisonInstr *UI,
     InstrByName[UI->Name] = UI;
 }
 
-void Unison::NamingScheme::nameAllVariablesInInstruction(UnisonInstr *UI) {
-  // TODO: Rework naming to use variable maps instead of UnisonInstr fields.
-  // Variables are no longer stored on UnisonInstr — they're in the
-  // RegVars/ChoiceVars/ICVars/InsVars maps on the Unison class.
+void Unison::nameAllVariablesInInstruction(UnisonInstr *UI,
+                                           sat::CpModelBuilder &M) {
+  // IC variable.
+  NS.registerVar(NamingScheme::nameVariable(UI->Name, "ic"),
+                 getICVar(UI, M));
+
+  // Def RegVars.
+  for (unsigned I = 0; I < UI->Defs.size(); I++)
+    NS.registerVar(NamingScheme::nameVariable(UI->Name,
+                       "def[" + Twine(I) + "].reg"),
+                   getRegVar(UI->Defs[I], M));
+
+  // Use ChoiceVars.
+  for (unsigned I = 0; I < UI->Uses.size(); I++)
+    NS.registerVar(NamingScheme::nameVariable(UI->Name,
+                       "use[" + Twine(I) + "].choice"),
+                   getChoiceVar(UI->Uses[I], M));
+
+  // CopyOp InsVar.
+  if (UI->isCopyOp())
+    NS.registerVar(NamingScheme::nameVariable(UI->Name, "ins"),
+                   getInsVar(UI, M));
 }
 
 void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
@@ -1035,6 +1056,9 @@ void Unison::createVariables(sat::CpModelBuilder &M) {
             : M.NewIntVar({0, static_cast<int64_t>(N - 1)});
         InsVars[UI].push_back({&M, IV});
       }
+
+      // Name all variables for this instruction.
+      nameAllVariablesInInstruction(UI, M);
     }
   }
 }
@@ -1142,12 +1166,10 @@ void Unison::copyExtend() {
 
           // Name after wiring so nameInstruction can walk def-use chains.
           NS.nameInstruction(LoadMove, {}, 0);
-          NS.nameAllVariablesInInstruction(LoadMove);
         }
 
         // Name StoreMove after all LoadMoves are wired.
         NS.nameInstruction(StoreMove, {}, 0);
-        NS.nameAllVariablesInInstruction(StoreMove);
       }
     }
   }
