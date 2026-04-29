@@ -524,7 +524,7 @@ private:
   // Create solver variables for a single instruction in the given model.
   void createVariablesForInstr(UnisonInstr *UI, UnisonMBB &UMBB,
                                sat::CpModelBuilder &M);
-  void assignPhysRegVarsFromEqClasses();
+  void assignPhysRegVarsFromEqClasses(sat::CpModelBuilder &M);
   void copyExtend();
   // Create solver variables for all instructions in the given model.
   // Populates RegVars, ChoiceVars, ICVars, InsVars.
@@ -1048,25 +1048,20 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
     }
   }
   LLVM_DEBUG(dbgs() << "  CrossBlockVRegs: " << CrossBlockVRegs.size() << "\n");
-
-  assignPhysRegVarsFromEqClasses();
 }
 
-// For each vreg equivalence class, create one solver variable in the given
-// model and map all defs of that vreg to it via RegVars.
+// For each vreg equivalence class, create one shared solver variable
+// in the given model and map all defs of that vreg to it via RegVars.
 // LiveInDef defs are excluded — they get their own variables.
-void Unison::assignPhysRegVarsFromEqClasses() {
-  LLVM_DEBUG(dbgs() << "  VRegDefClass has " << UFunc.VRegDefClass.size()
-                    << " vregs\n");
+void Unison::assignPhysRegVarsFromEqClasses(sat::CpModelBuilder &M) {
   for (auto &[Reg, Defs] : UFunc.VRegDefClass) {
-    LLVM_DEBUG(dbgs() << "    " << printReg(Reg, A.TRI)
-                      << " (" << Defs.size() << " defs)\n");
     const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
     operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
-    sat::IntVar PhysRegVar = Model.NewIntVar(Dom);
-    VRegToPhysRegVar[Reg] = PhysRegVar;
+    sat::IntVar PhysRegVar = M.NewIntVar(Dom);
+    if (&M == &Model)
+      VRegToPhysRegVar[Reg] = PhysRegVar;
     for (UnisonDef *D : Defs)
-      RegVars[D].push_back({&Model, PhysRegVar});
+      RegVars[D].push_back({&M, PhysRegVar});
   }
 }
 
@@ -2393,6 +2388,11 @@ bool Unison::run() {
 
   // Initialize per-MBB local models.
   LocalModels.resize(UFunc.MBBs.size());
+
+  // Shared vreg variables in monolithic model (legacy).
+  LLVM_DEBUG(dbgs() << "  VRegDefClass has " << UFunc.VRegDefClass.size()
+                    << " vregs\n");
+  assignPhysRegVarsFromEqClasses(Model);
 
   // Create variables in GlobalModel and per-MBB LocalModels.
   // Non-local instructions get variables in both their LocalModel and GlobalModel.
