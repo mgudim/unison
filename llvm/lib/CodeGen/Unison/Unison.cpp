@@ -367,6 +367,10 @@ private:
   // The Unison model for the entire function.
   UnisonFunction UFunc;
 
+  // Vregs whose live ranges cross block boundaries.
+  // Populated during buildUnisonInstructionsAndAnalyzeDefs.
+  DenseSet<Register> CrossBlockVRegs;
+
   // For each (def, use) pair, the index of the def in the use's PotentialDefs.
   using DefUseKey = std::pair<UnisonDef *, UnisonUse *>;
   DenseMap<DefUseKey, unsigned> DefIdxInUseMap;
@@ -486,6 +490,12 @@ private:
   // Applies uniformly to LiveInDef, RealInstr, and LiveOutUse.
   void populateDefsAndUses(UnisonInstr *UInstr, MachineBasicBlock &MBB,
                          DenseMap<Register, UnisonDef *> &LocalReachingDefs);
+
+  // Returns true if the instruction only touches block-local live ranges.
+  // LiveInDef and LiveOutUse are always non-local.
+  // A RealInstr is local if none of its def/use vregs are in CrossBlockVRegs.
+  // A CopyOp inherits locality from the vreg it serves.
+  bool isLocal(UnisonInstr *UI, MachineBasicBlock &MBB) const;
 
   // Upper bound on issue cycles for a given MBB, used for solver variable
   // domains. In TwoSlot mode: 2 * (num_instrs + 2) to account for
@@ -756,6 +766,53 @@ void Unison::populateDefsAndUses(UnisonInstr *UInstr, MachineBasicBlock &MBB,
   }
 }
 
+bool Unison::isLocal(UnisonInstr *UI, MachineBasicBlock &MBB) const {
+  // Boundary instructions are always non-local.
+  if (UI->K == UnisonInstr::LiveInDef || UI->K == UnisonInstr::LiveOutUse)
+    return false;
+
+  // CopyOp: trace back to the original real def's register.
+  // The CopyOp's use (Uses[0]) connects to a def chain; if ANY vreg
+  // in that chain is cross-block, this CopyOp is non-local.
+  if (UI->isCopyOp()) {
+    // Walk from the CopyOp's use to its potential source defs.
+    for (UnisonDef *SrcDef : UI->Uses[0]->PotentialDefs) {
+      // Find the original real instruction def by walking up CopyOp chains.
+      UnisonDef *D = SrcDef;
+      while (D->Parent->isCopyOp() && !D->Parent->Uses.empty())
+        D = D->Parent->Uses[0]->PotentialDefs[0];
+      // Check all registers in the original defining instruction.
+      SmallVector<Register> DefRegs;
+      getDefsFromUnisonInstr(D->Parent, MBB, DefRegs);
+      for (Register Reg : DefRegs)
+        if (Reg.isVirtual() && CrossBlockVRegs.contains(Reg))
+          return false;
+    }
+    // Also check the CopyOp's own def destination.
+    // (Its def may feed into a cross-block use.)
+    for (UnisonDef *D : UI->Defs)
+      for (UnisonUse *U : D->PotentialUses)
+        if (U->Parent->K == UnisonInstr::LiveOutUse)
+          return false;
+    return true;
+  }
+
+  // RealInstr: check all def and use registers.
+  SmallVector<Register> Regs;
+  getDefsFromUnisonInstr(UI, MBB, Regs);
+  for (Register Reg : Regs)
+    if (Reg.isVirtual() && CrossBlockVRegs.contains(Reg))
+      return false;
+
+  Regs.clear();
+  getUsesFromUnisonInstr(UI, MBB, Regs);
+  for (Register Reg : Regs)
+    if (Reg.isVirtual() && CrossBlockVRegs.contains(Reg))
+      return false;
+
+  return true;
+}
+
 int Unison::getIssueCycleUpperBound(MachineBasicBlock &MBB) const {
   // Count real (non-debug) instructions.
   unsigned NumInstrs = 0;
@@ -974,6 +1031,22 @@ void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
 
     UFunc.MBBs.push_back(std::move(UMBB));
   }
+
+  // Populate CrossBlockVRegs: any vreg that is live-in or live-out of any MBB.
+  for (unsigned I = 0, E = A.MRI->getNumVirtRegs(); I != E; ++I) {
+    Register Reg = Register::index2VirtReg(I);
+    if (A.MRI->reg_nodbg_empty(Reg) || !A.LIS->hasInterval(Reg))
+      continue;
+    const LiveInterval &LI = A.LIS->getInterval(Reg);
+    for (const MachineBasicBlock &MBB : MF) {
+      if (A.LIS->isLiveInToMBB(LI, &MBB) ||
+          A.LIS->isLiveOutOfMBB(LI, &MBB)) {
+        CrossBlockVRegs.insert(Reg);
+        break;
+      }
+    }
+  }
+  LLVM_DEBUG(dbgs() << "  CrossBlockVRegs: " << CrossBlockVRegs.size() << "\n");
 
   assignPhysRegVarsFromEqClasses();
 }
@@ -2310,6 +2383,17 @@ bool Unison::run() {
   buildURegisterDomains();
   buildUnisonInstructionsAndAnalyzeDefs();  // IR only, no solver vars
   copyExtend();                              // IR only, no solver vars
+
+  LLVM_DEBUG({
+    for (auto &UMBB : UFunc.MBBs) {
+      dbgs() << "  MBB#" << UMBB->MBB->getNumber() << " locality:\n";
+      for (auto &UIP : UMBB->Instrs)
+        dbgs() << "    " << UIP->Name << ": "
+               << (isLocal(UIP.get(), *UMBB->MBB) ? "local" : "GLOBAL")
+               << "\n";
+    }
+  });
+
   createVariables(Model);                    // create all solver vars in Model
   addConstraints();
   addObjectiveFunction();
