@@ -2575,14 +2575,24 @@ void Unison::generateInstructions() {
     }
     MBB->sortUniqueLiveIns();
 
-    // Emit all instructions in IC order.
+    // Emit all non-terminator instructions first, then terminators.
+    // CopyOps may have ICs after the terminator (due to ordering
+    // constraints placing them after the last barrier), but they
+    // must be emitted before terminators to remain reachable.
+    SmallVector<UnisonInstr *, 16> PreTerm, Terminators;
     for (auto &UIP : UMBB.Instrs) {
       UnisonInstr *UI = &UIP;
-
       if (UI->K == UnisonInstr::LiveInDef ||
           UI->K == UnisonInstr::LiveOutUse)
         continue;
+      if (UI->K == UnisonInstr::RealInstr && UI->RealMI &&
+          UI->RealMI->isTerminator())
+        Terminators.push_back(UI);
+      else
+        PreTerm.push_back(UI);
+    }
 
+    for (UnisonInstr *UI : PreTerm) {
       if (UI->K == UnisonInstr::RealInstr) {
         assert(UI->RealMI);
         rewriteRealInstr(UI);
@@ -2590,6 +2600,11 @@ void Unison::generateInstructions() {
       } else if (UI->isCopyOp()) {
         materializeCopyOp(UI, MBB, MBB->end(), MBBIdx);
       }
+    }
+    for (UnisonInstr *UI : Terminators) {
+      assert(UI->RealMI);
+      rewriteRealInstr(UI);
+      MBB->push_back(UI->RealMI);
     }
   }
 }
