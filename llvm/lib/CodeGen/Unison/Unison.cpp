@@ -234,6 +234,18 @@ public:
     void insertAfter(UnisonInstr *Pos, UnisonInstr *UI) {
       Instrs.insertAfter(Pos->getIterator(), UI);
     }
+
+    // Return iterator to the first terminator RealInstr, or to LiveOutUse
+    // if there are no terminators.
+    ilist<UnisonInstr>::iterator getFirstTerminator() {
+      for (auto It = Instrs.begin(); It != Instrs.end(); ++It) {
+        if (It->K == UnisonInstr::RealInstr && It->RealMI &&
+            It->RealMI->isTerminator())
+          return It;
+      }
+      // No terminators — return LiveOutUse position.
+      return getLiveOut()->getIterator();
+    }
   };
 
   class UnisonFunction {
@@ -1266,7 +1278,15 @@ void Unison::copyExtend() {
             LoadOpcodes.push_back(COPY_REMAT);
 
           UnisonInstr *LoadMove = createCopyOp(LoadOpcodes);
-          UMBB->insertBefore(RealUse->Parent, LoadMove);
+          // Insert before the use's parent, but if the parent is
+          // LiveOutUse, insert before the first terminator instead.
+          // This ensures ordering constraints place the LoadMove
+          // before the terminator barrier, so NoOverlap2D prevents
+          // it from clobbering registers the terminator reads.
+          if (RealUse->Parent->K == UnisonInstr::LiveOutUse)
+            UMBB->Instrs.insert(UMBB->getFirstTerminator(), LoadMove);
+          else
+            UMBB->insertBefore(RealUse->Parent, LoadMove);
           ToSkip.insert(LoadMove);
           if (CanRemat)
             RematMIs[LoadMove] = Instr.RealMI;
@@ -2575,24 +2595,14 @@ void Unison::generateInstructions() {
     }
     MBB->sortUniqueLiveIns();
 
-    // Emit all non-terminator instructions first, then terminators.
-    // CopyOps may have ICs after the terminator (due to ordering
-    // constraints placing them after the last barrier), but they
-    // must be emitted before terminators to remain reachable.
-    SmallVector<UnisonInstr *, 16> PreTerm, Terminators;
+    // Emit all instructions in IC order.
     for (auto &UIP : UMBB.Instrs) {
       UnisonInstr *UI = &UIP;
+
       if (UI->K == UnisonInstr::LiveInDef ||
           UI->K == UnisonInstr::LiveOutUse)
         continue;
-      if (UI->K == UnisonInstr::RealInstr && UI->RealMI &&
-          UI->RealMI->isTerminator())
-        Terminators.push_back(UI);
-      else
-        PreTerm.push_back(UI);
-    }
 
-    for (UnisonInstr *UI : PreTerm) {
       if (UI->K == UnisonInstr::RealInstr) {
         assert(UI->RealMI);
         rewriteRealInstr(UI);
@@ -2600,11 +2610,6 @@ void Unison::generateInstructions() {
       } else if (UI->isCopyOp()) {
         materializeCopyOp(UI, MBB, MBB->end(), MBBIdx);
       }
-    }
-    for (UnisonInstr *UI : Terminators) {
-      assert(UI->RealMI);
-      rewriteRealInstr(UI);
-      MBB->push_back(UI->RealMI);
     }
   }
 }
