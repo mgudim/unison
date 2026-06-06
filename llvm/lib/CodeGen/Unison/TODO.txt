@@ -54,6 +54,66 @@ Key insight: CpModelBuilder::Clone() lets us reuse the base local model
 across global iterations. Each iteration clones, adds equalities, solves.
 No model rebuild needed.
 
+Removing legacy Model — Step-by-step plan
+------------------------------------------
+
+Step 1: Thread &M through helpers (currently use Model directly)
+  [x] reifyEquality(Var, Value) → add &M
+  [x] reifyNotEqual(A, B) → add &M
+  [x] reifyAnd(X, Y) → add &M
+  [x] restrictToDomain(Var, Dom) → add &M
+  [x] restrictToDomain(Var, Dom, Condition) ��� add &M
+
+Step 2: Thread &M through per-MBB constraint functions, wire callers
+        to pass LocalModels[idx]
+  [x] addRegAllocConstraints(UMBB) → add &M
+  [x] addNoOverlapConstraints(UMBB) → add &M
+  [x] addRectangle(UMBB, ...) → add &M
+  [x] getDefLastUseCycle(UInstr, DefIdx, UB) → add &M
+  [x] addRegClassConstraints(UMBB) → add &M
+  [x] deriveActivationVars(UMBB) → add &M
+  [x] deriveDefActivation(UInstr, DI) → add &M
+  [x] addSchedConstraints(UMBB) → add &M
+  [x] addDataDependencyConstraints(UMBB) → add &M
+  [x] addAntiDependencyConstraints(UMBB) → add &M
+  [x] addOrderingConstraints(UMBB) → add &M
+  [x] getIsNotIdentityCopy(UInstr) → add &M
+  [x] penalizeCopies(Objective) → add &M
+  [x] addMinimizeMakespanObjective(Objective) → add &M
+  [x] Update addConstraints() to pass LocalModels[idx]
+  [x] Remove Model member, createVariables(Model), assignPhysRegVarsFromEqClasses(Model)
+
+Step 3: Thread &M through cross-block constraint functions → GlobalModel
+  [x] Congruence: explicit per-boundary vars (GlobalLiveInVar, GlobalLiveOutVar)
+      with AddEquality across CFG edges in addGlobalConstraints()
+  [x] addGlobalConstraints(): congruence constraints (LiveOut == LiveIn per edge)
+  [ ] addLiveInDefLinkConstraints() → deferred to Step 6 (iteration loop)
+  [x] penalizeCalleeSavedRegisters(Objective) → iterates boundary vars
+
+Step 4: Split objective function
+  [ ] addObjectiveFunction() → split into per-MBB and global parts
+  [ ] Per-MBB: makespan + copy cost → LocalModels[idx].Minimize(...)
+  [ ] Global: spill cost, CSR usage → GlobalModel.Minimize(...)
+
+Step 5: Update solve/codegen/dump to use split models
+  [ ] solve() → solve each LocalModel (no iteration loop yet)
+  [ ] dumpSolution → pass correct model per MBB
+  [ ] loadPreAssignments → pass correct model
+  [ ] sortByIssueCycle → pass correct LocalModel per MBB
+  [ ] materializeCopyOp → pass correct LocalModel
+  [ ] generateInstructions → pass correct LocalModel per MBB
+
+Step 6: Implement Global↔Local iteration loop
+  [ ] Build all local models (constraints only, no cross-block equalities)
+  [ ] Build global model with congruence + interference constraints
+  [ ] Clone-solve iteration: solve Global, clone Local + equalities, solve
+  [ ] Add nogoods on infeasibility
+  [ ] Generate code from combined solution
+
+Step 7: Fix assignPhysRegVarsFromEqClasses
+  [ ] Change `if (&M == &Model)` → `if (&M == &GlobalModel)` for VRegToPhysRegVar
+  [ ] Call on GlobalModel and each LocalModel
+
 Other TODOs
 -----------
 

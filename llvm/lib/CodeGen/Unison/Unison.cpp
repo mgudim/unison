@@ -45,6 +45,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/ilist.h"
+#include "llvm/ADT/ilist_node.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -59,6 +62,7 @@
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineCycleAnalysis.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -134,6 +138,12 @@ static cl::opt<bool> UnisonPreserveOrder(
     cl::init(true),
     cl::Hidden);
 
+static cl::opt<int> UnisonMaxBendersIter(
+    "unison-max-benders-iter",
+    cl::desc("Maximum Benders decomposition iterations (global/local loop)"),
+    cl::init(50),
+    cl::Hidden);
+
 // UnisonInstr represents an instruction in the model. RealInstr wraps a
 // MachineInstr; LiveInDef/LiveOutUse are synthetic boundary instructions;
 // CopyOp models potential spills/reloads with alternative instructions.
@@ -161,6 +171,7 @@ public:
   class UnisonDef {
   public:
     UnisonInstr *Parent = nullptr;
+    Register Reg;
     SmallVector<UnisonUse *, 4> PotentialUses;
   };
 
@@ -168,10 +179,11 @@ public:
   class UnisonUse {
   public:
     UnisonInstr *Parent = nullptr;
+    Register Reg;
     SmallVector<UnisonDef *, 2> PotentialDefs;
   };
 
-  class UnisonInstr {
+  class UnisonInstr : public ilist_node<UnisonInstr> {
   public:
     enum Kind {
       RealInstr,
@@ -193,53 +205,84 @@ public:
   };
 
   class UnisonMBB {
+    UnisonInstr *LiveInPtr = nullptr;
+    UnisonInstr *LiveOutPtr = nullptr;
+
   public:
     MachineBasicBlock *MBB = nullptr;
-    std::list<std::unique_ptr<UnisonInstr>> Instrs;
+    ilist<UnisonInstr> Instrs;
     std::optional<sat::NoOverlap2DConstraint> NoOverlap;
     int IssueCycleUpperBound = 0;
+    DenseMap<Register, UnisonDef *> LocalReachingDefs;
+
+    UnisonInstr *getLiveIn() const { return LiveInPtr; }
+    UnisonInstr *getLiveOut() const { return LiveOutPtr; }
+
+    void setLiveIn(UnisonInstr *UI) {
+      assert(UI->K == UnisonInstr::LiveInDef);
+      LiveInPtr = UI;
+    }
+    void setLiveOut(UnisonInstr *UI) {
+      assert(UI->K == UnisonInstr::LiveOutUse);
+      LiveOutPtr = UI;
+    }
+
+    void addUnisonInstr(UnisonInstr *UI) { Instrs.push_back(UI); }
+    void insertBefore(UnisonInstr *Pos, UnisonInstr *UI) {
+      Instrs.insert(Pos->getIterator(), UI);
+    }
+    void insertAfter(UnisonInstr *Pos, UnisonInstr *UI) {
+      Instrs.insertAfter(Pos->getIterator(), UI);
+    }
   };
 
   class UnisonFunction {
   public:
     BumpPtrAllocator OperandAlloc;
     SmallVector<std::unique_ptr<UnisonMBB>> MBBs;
+    DenseMap<MachineBasicBlock *, UnisonMBB *> MBBMap;
 
-    // Equivalence classes of def operands that must share a PhysRegVar.
-    DenseMap<Register, SmallVector<UnisonDef *, 2>> VRegDefClass;
+    UnisonMBB *getUMBB(MachineBasicBlock *MBB) const {
+      auto It = MBBMap.find(MBB);
+      assert(It != MBBMap.end() && "MBB not in UnisonFunction");
+      return It->second;
+    }
+
   };
 
   // --- Solver variable map (separate from IR) ---
-  // Maps IR nodes to solver variables. Supports multiple models per node
-  // (e.g., a cross-block vreg has a var in GlobalModel and LocalModel).
-  using VarEntry = std::pair<sat::CpModelBuilder *, sat::IntVar>;
+  // Maps (IR node, model) pairs to solver variables. A cross-block vreg
+  // may have variables in both GlobalModel and a LocalModel.
+  using DefModelKey = std::pair<UnisonDef *, sat::CpModelBuilder *>;
+  using UseModelKey = std::pair<UnisonUse *, sat::CpModelBuilder *>;
+  using InstrModelKey = std::pair<UnisonInstr *, sat::CpModelBuilder *>;
 
-  DenseMap<UnisonDef *, SmallVector<VarEntry, 2>> RegVars;
-  DenseMap<UnisonUse *, SmallVector<VarEntry, 2>> ChoiceVars;
-  DenseMap<UnisonInstr *, SmallVector<VarEntry, 2>> ICVars;
-  DenseMap<UnisonInstr *, SmallVector<VarEntry, 2>> InsVars;
-  DenseMap<UnisonInstr *, SmallVector<VarEntry, 2>> ActiveVars;
+  DenseMap<DefModelKey, sat::IntVar> RegVars;
+  DenseMap<UseModelKey, sat::IntVar> ChoiceVars;
+  DenseMap<InstrModelKey, sat::IntVar> ICVars;
+  DenseMap<InstrModelKey, sat::IntVar> InsVars;
+  DenseMap<InstrModelKey, sat::IntVar> ActiveVars;
 
   // Look up the solver variable for a given IR node in a given model.
   sat::IntVar getRegVar(UnisonDef *D, sat::CpModelBuilder &M) const {
-    for (auto &[Model, Var] : RegVars.lookup(D))
-      if (Model == &M) return Var;
-    llvm_unreachable("no RegVar for this def in this model");
+    auto It = RegVars.find({D, &M});
+    assert(It != RegVars.end() && "no RegVar for this def in this model");
+    return It->second;
   }
   sat::IntVar getChoiceVar(UnisonUse *U, sat::CpModelBuilder &M) const {
-    for (auto &[Model, Var] : ChoiceVars.lookup(U))
-      if (Model == &M) return Var;
-    llvm_unreachable("no ChoiceVar for this use in this model");
+    auto It = ChoiceVars.find({U, &M});
+    assert(It != ChoiceVars.end() && "no ChoiceVar for this use in this model");
+    return It->second;
   }
   sat::IntVar getICVar(UnisonInstr *I, sat::CpModelBuilder &M) const {
-    for (auto &[Model, Var] : ICVars.lookup(I))
-      if (Model == &M) return Var;
-    llvm_unreachable("no ICVar for this instr in this model");
+    auto It = ICVars.find({I, &M});
+    assert(It != ICVars.end() && "no ICVar for this instr in this model");
+    return It->second;
   }
   sat::IntVar getInsVar(UnisonInstr *I, sat::CpModelBuilder &M) const {
-    for (auto &[Model, Var] : InsVars.lookup(I))
-      if (Model == &M) return Var;
-    llvm_unreachable("no InsVar for this instr in this model");
+    auto It = InsVars.find({I, &M});
+    assert(It != InsVars.end() && "no InsVar for this instr in this model");
+    return It->second;
   }
 
   // Rematerialization map: only populated for rematerializable CopyOps.
@@ -261,12 +304,6 @@ public:
         VarByName[Name] = Var;
     }
 
-    void registerBoolVar(StringRef Name, sat::BoolVar Var) {
-      Var.WithName(Name.str());
-      if (BuildMap)
-        VarByName[Name] = sat::IntVar(Var);
-    }
-
     static SmallString<32> nameVariable(StringRef InstrName,
                                         const Twine &VarSuffix) {
       SmallString<32> Result(InstrName);
@@ -279,17 +316,7 @@ public:
                          unsigned InstrIdx);
 
     void nameActiveVar(UnisonInstr *UI, sat::BoolVar Active) {
-      registerBoolVar(nameVariable(UI->Name, "active"), Active);
-    }
-
-    void renameChoiceVar(UnisonInstr *UI, unsigned UseIdx, sat::IntVar Var) {
-      registerVar(nameVariable(UI->Name, "use[" + Twine(UseIdx) + "].choice"),
-                  Var);
-    }
-
-    void renameDefReg(UnisonInstr *UI, unsigned DefIdx, sat::IntVar Var) {
-      registerVar(nameVariable(UI->Name, "def[" + Twine(DefIdx) + "].reg"),
-                  Var);
+      registerVar(nameVariable(UI->Name, "active"), sat::IntVar(Active));
     }
 
     std::optional<sat::IntVar> getVariableByName(StringRef Name) const {
@@ -347,9 +374,6 @@ private:
   // Indexed by position in UFunc.MBBs.
   SmallVector<sat::CpModelBuilder> LocalModels;
 
-  // Legacy monolithic model — used during transition. Will be removed
-  // once the global/local solving loop is fully wired.
-  sat::CpModelBuilder Model;
 
   // --- Register/memory index space ---
   // Physical registers: [0, NumPhysRegs)
@@ -366,16 +390,17 @@ private:
   operations_research::Domain RegMemDomain; // [0, NumPhysRegs+NumMemSlots)
 
   // Restrict a variable to a domain. No-op if the variable is constant.
-  void restrictToDomain(sat::IntVar Var, const operations_research::Domain &Dom);
+  void restrictToDomain(sat::IntVar Var, const operations_research::Domain &Dom,
+                        sat::CpModelBuilder &M);
   // Conditional version: only enforce if BoolVar is true.
   void restrictToDomain(sat::IntVar Var, const operations_research::Domain &Dom,
-                        sat::BoolVar Condition);
+                        sat::BoolVar Condition, sat::CpModelBuilder &M);
 
   // The Unison model for the entire function.
   UnisonFunction UFunc;
 
   // Vregs whose live ranges cross block boundaries.
-  // Populated during buildUnisonInstructionsAndAnalyzeDefs.
+  // Populated during createUnisonProgramRepresentation.
   DenseSet<Register> CrossBlockVRegs;
 
   // For each (def, use) pair, the index of the def in the use's PotentialDefs.
@@ -408,7 +433,7 @@ private:
     if (It != DChosenInUMap.end())
       return It->second;
     unsigned DefIdx = DefIdxInUseMap.lookup(Key);
-    sat::BoolVar B = reifyEquality(getChoiceVar(U, M), DefIdx);
+    sat::BoolVar B = reifyEquality(getChoiceVar(U, M), DefIdx, M);
     DChosenInUMap[Key] = B;
     return B;
   }
@@ -416,20 +441,26 @@ private:
   // Activation BoolVars for optional (CopyOp) instructions.
   DenseMap<UnisonInstr *, sat::BoolVar> IsActiveVar;
 
-  // Per-vreg shared PhysRegVar (used for cross-block congruence).
-  DenseMap<Register, sat::IntVar> VRegToPhysRegVar;
+  // Per-boundary GlobalModel variables for cross-block vregs.
+  // Each MBB where a vreg is live-in/live-out gets its own variable.
+  // Congruence is explicit: for each CFG edge, LiveOut == LiveIn.
+  // Populated during createVariables().
+  using BoundaryKey = std::pair<UnisonMBB *, Register>;
+  DenseMap<BoundaryKey, sat::IntVar> GlobalLiveInVar;
+  DenseMap<BoundaryKey, sat::IntVar> GlobalLiveOutVar;
 
   // At code gen time, actual stack slot = FirstNewStackSlot + (solved value - NumPhysRegs).
   int FirstNewStackSlot = 0;
 
-  // Solver response, stored after solve() for use by generateCodeFromSolution().
-  sat::CpSolverResponse SolverResponse;
+  // Solver responses, stored after solve() for use by generateCodeFromSolution().
+  sat::CpSolverResponse GlobalResponse;
+  SmallVector<sat::CpSolverResponse, 0> LocalResponses;
 
   SchedModelKind SchedKind = SchedModelKind::TwoSlot;
 
   // --- Allocation helpers ---
-  // Allocate a UnisonInstr. Returns a unique_ptr; caller handles insertion.
-  static std::unique_ptr<UnisonInstr> allocateUnisonInstr(
+  // Allocate a UnisonInstr. Caller handles insertion into an ilist.
+  static UnisonInstr *allocateUnisonInstr(
       UnisonInstr::Kind K, MachineInstr *RealMI = nullptr);
 
   // Allocate a UnisonDef from the bump-ptr allocator.
@@ -455,11 +486,14 @@ private:
   void addDefChoice(UnisonUse *U, UnisonDef *D);
 
   // Full reification: returns a BoolVar B such that B <=> (Var == Value).
-  sat::BoolVar reifyEquality(sat::IntVar Var, int64_t Value);
+  sat::BoolVar reifyEquality(sat::IntVar Var, int64_t Value,
+                             sat::CpModelBuilder &M);
   // Full reification: returns a BoolVar B such that B <=> (A != B).
-  sat::BoolVar reifyNotEqual(sat::IntVar A, sat::IntVar B);
+  sat::BoolVar reifyNotEqual(sat::IntVar A, sat::IntVar B,
+                             sat::CpModelBuilder &M);
   // Full reification: returns a BoolVar B such that B <=> (X AND Y).
-  sat::BoolVar reifyAnd(sat::BoolVar X, sat::BoolVar Y);
+  sat::BoolVar reifyAnd(sat::BoolVar X, sat::BoolVar Y,
+                        sat::CpModelBuilder &M);
 
   // A canonical operand entry: the register and optionally a pointer to
   // the MachineOperand (null for regmask clobbers).
@@ -487,13 +521,13 @@ private:
   //   explicitly defined are skipped.
   // For LiveInDef: one def per live-in register (phys and virt).
   // For LiveOutUse: one use per live-out register (phys and virt).
-  void getDefsFromUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
+  void collectDefsForUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
                              SmallVectorImpl<Register> &Defs) const;
-  void getUsesFromUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
+  void collectUsesForUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
                              SmallVectorImpl<Register> &Uses) const;
 
   // Process one UnisonInstr: populate its Defs/Uses vectors, wire
-  // def-use connections, update LocalReachingDefs and VRegDefClass.
+  // def-use connections, update LocalReachingDefs.
   // Applies uniformly to LiveInDef, RealInstr, and LiveOutUse.
   void populateDefsAndUses(UnisonInstr *UInstr, MachineBasicBlock &MBB,
                          DenseMap<Register, UnisonDef *> &LocalReachingDefs);
@@ -516,56 +550,67 @@ private:
   NamingScheme NS;
 
   // Name all solver variables for a UnisonInstr in the given model.
-  // Must be called after createVariables().
+  // Must be called after createVariablesForInstr().
   void nameAllVariablesInInstruction(UnisonInstr *UI, sat::CpModelBuilder &M);
 
   // --- Pipeline stages ---
-  void buildUnisonInstructionsAndAnalyzeDefs();
-  // Create solver variables for a single instruction in the given model.
+  void createUnisonProgramRepresentation();
+  // Create all solver variables: LocalModels get variables for all
+  // instructions; GlobalModel additionally gets variables for
+  // LiveInDef/LiveOutUse defs of cross-block vregs.
+  void createVariables();
+  // Create solver variables for a single instruction in the LocalModel.
+  // For LiveInDef/LiveOutUse instructions with cross-block vreg defs,
+  // also creates variables in the GlobalModel.
+  // LocalVRegVars maps vreg Register -> shared IntVar for the local model.
   void createVariablesForInstr(UnisonInstr *UI, UnisonMBB &UMBB,
-                               sat::CpModelBuilder &M);
-  void assignPhysRegVarsFromEqClasses(sat::CpModelBuilder &M);
+                               sat::CpModelBuilder &M,
+                               DenseMap<Register, sat::IntVar> &LocalVRegVars);
   void copyExtend();
-  // Create solver variables for all instructions in the given model.
-  // Populates RegVars, ChoiceVars, ICVars, InsVars.
-  void createVariables(sat::CpModelBuilder &M);
   // --- Constraint generation ---
   void addConstraints();
 
   // Per-MBB register allocation constraints.
-  void addRegAllocConstraints(UnisonMBB &UMBB);
-  void addNoOverlapConstraints(UnisonMBB &UMBB);
+  void addRegAllocConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
+  void addNoOverlapConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
   // Add a rectangle to the NoOverlap2D constraint. For CopyOps, the
   // rectangle is optional (gated on IsActive). For always-active instrs,
   // it's unconditional.
   void addRectangle(UnisonMBB &UMBB, UnisonInstr *UInstr,
                     sat::IntVar RegVar,
                     sat::IntVar TimeStart, sat::IntVar TimeSize,
-                    sat::IntVar TimeEnd);
+                    sat::IntVar TimeEnd, sat::CpModelBuilder &M);
   // Returns max over active uses of IssueCycle(use_instr). Each use
   // contributes conditionally (DActiveInU). Inactive uses contribute the
   // definer's IC. For dead defs (no uses), returns the definer's IC.
   // Caller computes TimeEnd = result + 1 (half-open interval).
   sat::IntVar getDefLastUseCycle(UnisonInstr *UInstr, unsigned DefIdx,
-                                int IssueCycleUB);
-  void addRegClassConstraints(UnisonMBB &UMBB);
-  void deriveActivationVars(UnisonMBB &UMBB);
-  sat::BoolVar deriveDefActivation(UnisonInstr *UInstr, unsigned DefIdx);
+                                int IssueCycleUB, sat::CpModelBuilder &M);
+  void addRegClassConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
+  void deriveActivationVars(UnisonMBB &UMBB, sat::CpModelBuilder &M);
+  sat::BoolVar deriveDefActivation(UnisonInstr *UInstr, unsigned DefIdx,
+                                   sat::CpModelBuilder &M);
 
   // Per-MBB scheduling constraints.
-  void addSchedConstraints(UnisonMBB &UMBB);
-  void addDataDependencyConstraints(UnisonMBB &UMBB);
-  void addAntiDependencyConstraints(UnisonMBB &UMBB);
-  void addOrderingConstraints(UnisonMBB &UMBB);
+  void addSchedConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
+  void addDataDependencyConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
+  void addAntiDependencyConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
+  void addOrderingConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
 
-  // Cross-MBB constraints.
-  void addCongruenceConstraints();
-  void addLiveInDefLinkConstraints();
+  // Cross-MBB constraints (GlobalModel).
+  // Explicit congruence: LiveOut(pred) == LiveIn(succ) per CFG edge.
+  // LiveInDef linking is handled by the iteration loop (Step 6).
+  void addGlobalConstraints();
 
   void addObjectiveFunction();
-  void penalizeCopies(sat::LinearExpr &Objective);
-  void penalizeCalleeSavedRegisters(sat::LinearExpr &Objective);
-  void addMinimizeMakespanObjective(sat::LinearExpr &Objective);
+  void penalizeCopies(sat::LinearExpr &Objective, UnisonMBB &UMBB,
+                      sat::CpModelBuilder &M);
+  void penalizeCalleeSavedRegisters(sat::LinearExpr &Objective,
+                                    sat::CpModelBuilder &M);
+  void penalizeGlobalSpills(sat::LinearExpr &Objective,
+                            sat::CpModelBuilder &M);
+  void addMinimizeMakespanObjective(sat::LinearExpr &Objective, UnisonMBB &UMBB,
+                                    sat::CpModelBuilder &M);
 
   // Returns the set of register indices for callee-saved registers
   // that are NOT already modified in the function.
@@ -573,8 +618,13 @@ private:
 
   // Helper: returns a BoolVar that is true iff the given instruction's
   // def and use are at different registers (non-identity copy).
-  sat::BoolVar getIsNotIdentityCopy(UnisonInstr *UInstr);
+  sat::BoolVar getIsNotIdentityCopy(UnisonInstr *UInstr,
+                                    sat::CpModelBuilder &M);
   void solve();
+  // Pin global boundary assignments into a local proto copy (raw proto).
+  void pinBoundaryValuesToProto(sat::CpModelProto &Proto, unsigned MBBIdx);
+  // Add nogood to GlobalModel: forbid the current boundary assignment for MBBIdx.
+  void addNogoodForMBB(unsigned MBBIdx);
   void dumpSolution(StringRef Filename);
   void loadPreAssignments(StringRef Filename);
   int64_t getInsVarValueFromName(StringRef VarName, StringRef ValStr);
@@ -594,7 +644,8 @@ private:
   // (or null for identity moves).
   MachineInstr *materializeCopyOp(UnisonInstr *UInstr,
                                   MachineBasicBlock *MBB,
-                                  MachineBasicBlock::iterator InsertPt);
+                                  MachineBasicBlock::iterator InsertPt,
+                                  unsigned MBBIdx);
 
   // Maps memory indices to frame indices (stack slots).
   DenseMap<int, int> MemIdxToFrameIdx;
@@ -604,16 +655,13 @@ private:
 // Unison implementation
 // ---------------------------------------------------------------------------
 
-std::unique_ptr<Unison::UnisonInstr> Unison::allocateUnisonInstr(
+Unison::UnisonInstr *Unison::allocateUnisonInstr(
     UnisonInstr::Kind K, MachineInstr *RealMI) {
-  auto UInstr = std::make_unique<UnisonInstr>();
+  auto *UInstr = new UnisonInstr();
   UInstr->K = K;
   UInstr->RealMI = RealMI;
   return UInstr;
 }
-
-// createCopyOp removed — CopyOps are now created inline in copyExtend
-// with in-place insertion into the instruction list.
 
 void Unison::wireDefUse(UnisonDef *D, UnisonUse *U) {
   D->PotentialUses.push_back(U);
@@ -676,7 +724,7 @@ void Unison::getMIUsesInCanonicalOrder(MachineInstr &MI,
   }
 }
 
-void Unison::getDefsFromUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
+void Unison::collectDefsForUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
                                    SmallVectorImpl<Register> &Defs) const {
   Defs.clear();
 
@@ -707,7 +755,7 @@ void Unison::getDefsFromUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
     Defs.push_back(CO.Reg);
 }
 
-void Unison::getUsesFromUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
+void Unison::collectUsesForUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
                                    SmallVectorImpl<Register> &Uses) const {
   Uses.clear();
 
@@ -748,31 +796,28 @@ void Unison::populateDefsAndUses(UnisonInstr *UInstr, MachineBasicBlock &MBB,
   SmallVector<Register> UseRegs, DefRegs;
 
   // Process uses first (so use-and-def of same reg sees the previous def).
-  getUsesFromUnisonInstr(UInstr, MBB, UseRegs);
+  collectUsesForUnisonInstr(UInstr, MBB, UseRegs);
   for (unsigned I = 0, E = UseRegs.size(); I < E; ++I) {
     Register Reg = UseRegs[I];
     auto It = LocalReachingDefs.find(Reg);
     assert(It != LocalReachingDefs.end() && "Use without reaching def");
 
     UnisonUse *U = allocateUnisonUse(UInstr);
+    U->Reg = Reg;
     UInstr->Uses.push_back(U);
     wireDefUse(It->second, U);
   }
 
   // Process defs.
-  getDefsFromUnisonInstr(UInstr, MBB, DefRegs);
+  collectDefsForUnisonInstr(UInstr, MBB, DefRegs);
   for (unsigned I = 0, E = DefRegs.size(); I < E; ++I) {
     Register Reg = DefRegs[I];
     UnisonDef *D = allocateUnisonDef(UInstr);
+    D->Reg = Reg;
     UInstr->Defs.push_back(D);
 
     LocalReachingDefs[Reg] = D;
 
-    if (Reg.isVirtual() && UInstr->K != UnisonInstr::LiveInDef) {
-      // Real instruction defs and CopyOps: added to VRegDefClass
-      // to share a single Reg.Var per vreg.
-      UFunc.VRegDefClass[Reg].push_back(D);
-    }
   }
 }
 
@@ -799,16 +844,12 @@ bool Unison::isLocal(UnisonInstr *UI, MachineBasicBlock &MBB) const {
   }
 
   // RealInstr: check all def and use registers.
-  SmallVector<Register> Regs;
-  getDefsFromUnisonInstr(UI, MBB, Regs);
-  for (Register Reg : Regs)
-    if (Reg.isVirtual() && CrossBlockVRegs.contains(Reg))
+  for (UnisonDef *D : UI->Defs)
+    if (D->Reg.isVirtual() && CrossBlockVRegs.contains(D->Reg))
       return false;
 
-  Regs.clear();
-  getUsesFromUnisonInstr(UI, MBB, Regs);
-  for (Register Reg : Regs)
-    if (Reg.isVirtual() && CrossBlockVRegs.contains(Reg))
+  for (UnisonUse *U : UI->Uses)
+    if (U->Reg.isVirtual() && CrossBlockVRegs.contains(U->Reg))
       return false;
 
   return true;
@@ -982,151 +1023,172 @@ void Unison::nameAllVariablesInInstruction(UnisonInstr *UI,
                    getInsVar(UI, M));
 }
 
-void Unison::buildUnisonInstructionsAndAnalyzeDefs() {
+static bool isCFGReducible(MachineFunction &MF) {
+  MachineCycleInfo CI;
+  CI.compute(MF);
+  for (auto *TopCycle : CI.toplevel_cycles())
+    for (auto *Cycle : depth_first(TopCycle))
+      if (!Cycle->isReducible())
+        return false;
+  return true;
+}
+
+void Unison::createUnisonProgramRepresentation() {
+  buildURegisterDomains();
+
+  assert(isCFGReducible(MF) &&
+         "Irreducible CFG detected; Unison requires reducible control flow");
+
   // Traverse MBBs in reverse post-order. RPO guarantees that a block is
   // visited before any block it dominates (assuming reducible CFG), so the
   // defining block of a vreg is processed before blocks where that vreg
-  // is live-in. This ensures VRegDefClass already has an entry for a vreg
-  // when we encounter it as a live-in in a successor block.
+  // is live-in.
   for (MachineBasicBlock *MBB :
        ReversePostOrderTraversal<MachineFunction *>(&this->MF)) {
     auto UMBB = std::make_unique<UnisonMBB>();
     UMBB->MBB = MBB;
 
-    // Maps each register to its most recent def in this MBB. Needed
-    // because a register can be defined multiple times in a block
-    // (especially physical registers — e.g., $x10 as function arg,
-    // then clobbered by a call, then redefined as call return). When
-    // we encounter a use, this tells us which specific def it reads from.
-    DenseMap<Register, UnisonDef *> LocalReachingDefs;
     UMBB->IssueCycleUpperBound = getIssueCycleUpperBound(*MBB);
 
-    // Create a UnisonInstr and analyze defs/uses.
-    // No solver variables — those are created in a separate pass.
-    unsigned RICount = 0;
     SmallString<16> MBBPrefix("MBB");
     MBBPrefix += Twine(MBB->getNumber()).str();
-    auto addUnisonInstr = [&](UnisonInstr::Kind K, MachineInstr *RealMI) {
-      auto UInstrOwner = allocateUnisonInstr(K, RealMI);
-      UnisonInstr *UInstr = UInstrOwner.get();
-      UMBB->Instrs.push_back(std::move(UInstrOwner));
-      NS.nameInstruction(UInstr, MBBPrefix, RICount);
-      if (K == UnisonInstr::RealInstr)
-        RICount++;
-      populateDefsAndUses(UInstr, *MBB, LocalReachingDefs);
-      return UInstr;
+
+    auto makeInstr = [&](UnisonInstr::Kind K, MachineInstr *RealMI,
+                         const Twine &Name) -> UnisonInstr * {
+      UnisonInstr *UI = allocateUnisonInstr(K, RealMI);
+      UI->Name = Name.str();
+      populateDefsAndUses(UI, *MBB, UMBB->LocalReachingDefs);
+      UMBB->addUnisonInstr(UI);
+      return UI;
     };
 
-    addUnisonInstr(UnisonInstr::LiveInDef, nullptr);
+    UMBB->setLiveIn(makeInstr(UnisonInstr::LiveInDef, nullptr,
+                              MBBPrefix + ".LI"));
 
+    // Any vreg defined by LiveInDef is live-in to this MBB, hence cross-block.
+    for (UnisonDef *D : UMBB->getLiveIn()->Defs)
+      if (D->Reg.isVirtual())
+        CrossBlockVRegs.insert(D->Reg);
+
+    unsigned RIIdx = 0;
     for (MachineInstr &MI : *MBB) {
       if (MI.isDebugInstr())
         continue;
-      addUnisonInstr(UnisonInstr::RealInstr, &MI);
+      makeInstr(UnisonInstr::RealInstr, &MI,
+                MBBPrefix + ".RI" + Twine(RIIdx++));
     }
 
-    addUnisonInstr(UnisonInstr::LiveOutUse, nullptr);
+    UMBB->setLiveOut(makeInstr(UnisonInstr::LiveOutUse, nullptr,
+                               MBBPrefix + ".LO"));
 
     LLVM_DEBUG(dbgs() << "  MBB#" << MBB->getNumber() << ": "
                       << UMBB->Instrs.size() << " unison instrs\n");
 
+    UFunc.MBBMap[MBB] = UMBB.get();
     UFunc.MBBs.push_back(std::move(UMBB));
   }
 
-  // Populate CrossBlockVRegs: any vreg that is live-in or live-out of any MBB.
-  for (unsigned I = 0, E = A.MRI->getNumVirtRegs(); I != E; ++I) {
-    Register Reg = Register::index2VirtReg(I);
-    if (A.MRI->reg_nodbg_empty(Reg) || !A.LIS->hasInterval(Reg))
-      continue;
-    const LiveInterval &LI = A.LIS->getInterval(Reg);
-    for (const MachineBasicBlock &MBB : MF) {
-      if (A.LIS->isLiveInToMBB(LI, &MBB) ||
-          A.LIS->isLiveOutOfMBB(LI, &MBB)) {
-        CrossBlockVRegs.insert(Reg);
-        break;
-      }
-    }
-  }
   LLVM_DEBUG(dbgs() << "  CrossBlockVRegs: " << CrossBlockVRegs.size() << "\n");
+
+  copyExtend();
 }
 
-// For each vreg equivalence class, create one shared solver variable
-// in the given model and map all defs of that vreg to it via RegVars.
-// LiveInDef defs are excluded — they get their own variables.
-void Unison::assignPhysRegVarsFromEqClasses(sat::CpModelBuilder &M) {
-  for (auto &[Reg, Defs] : UFunc.VRegDefClass) {
-    const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
-    operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
-    sat::IntVar PhysRegVar = M.NewIntVar(Dom);
-    if (&M == &Model)
-      VRegToPhysRegVar[Reg] = PhysRegVar;
-    for (UnisonDef *D : Defs)
-      RegVars[D].push_back({&M, PhysRegVar});
+void Unison::createVariables() {
+  // Create variables for all instructions. LocalModels get everything;
+  // GlobalModel additionally gets variables for LiveInDef/LiveOutUse
+  // defs of cross-block vregs (created inside createVariablesForInstr).
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+    UnisonMBB &UMBB = *UFunc.MBBs[MBBIdx];
+    sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+    DenseMap<Register, sat::IntVar> LocalVRegVars;
+    for (auto &UIP : UMBB.Instrs)
+      createVariablesForInstr(&UIP, UMBB, LM, LocalVRegVars);
   }
 }
 
 void Unison::createVariablesForInstr(UnisonInstr *UI, UnisonMBB &UMBB,
-                                     sat::CpModelBuilder &M) {
+                                     sat::CpModelBuilder &M,
+                                     DenseMap<Register, sat::IntVar> &LocalVRegVars) {
   int UB = UMBB.IssueCycleUpperBound;
 
-  // Issue cycle.
+  // Issue cycle (LocalModel only).
   if (UI->K == UnisonInstr::LiveInDef)
-    ICVars[UI].push_back({&M, M.NewConstant(0)});
+    ICVars[{UI, &M}] = M.NewConstant(0);
   else
-    ICVars[UI].push_back({&M, M.NewIntVar({0, UB})});
+    ICVars[{UI, &M}] = M.NewIntVar({0, UB});
 
-  // Defs: RegVar. Skip defs already assigned via assignPhysRegVarsFromEqClasses.
-  SmallVector<Register> DefRegs;
-  getDefsFromUnisonInstr(UI, *UMBB.MBB, DefRegs);
+  // Defs: RegVar.
   for (unsigned I = 0; I < UI->Defs.size(); I++) {
     UnisonDef *D = UI->Defs[I];
-    // Already has a variable in this model (from assignPhysRegVarsFromEqClasses)?
-    bool Found = false;
-    for (auto &[Mdl, Var] : RegVars[D])
-      if (Mdl == &M) { Found = true; break; }
-    if (Found)
-      continue;
+    Register Reg = D->Reg;
 
-    Register Reg = I < DefRegs.size() ? DefRegs[I] : Register();
-    if (Reg.isValid() && Reg.isPhysical()) {
-      RegVars[D].push_back({&M, M.NewConstant(MCRegToIdx[MCRegister(Reg)])});
+    if (Reg.isValid() && Reg.isVirtual() &&
+        UI->K != UnisonInstr::LiveInDef) {
+      // Non-LiveInDef vreg defs share one solver variable per vreg
+      // within the local model (first def creates it, others reuse).
+      auto It = LocalVRegVars.find(Reg);
+      if (It != LocalVRegVars.end()) {
+        RegVars[{D, &M}] = It->second;
+      } else {
+        const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
+        operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
+        sat::IntVar Var = M.NewIntVar(Dom);
+        LocalVRegVars[Reg] = Var;
+        RegVars[{D, &M}] = Var;
+      }
+    } else if (Reg.isValid() && Reg.isPhysical()) {
+      RegVars[{D, &M}] = M.NewConstant(MCRegToIdx[MCRegister(Reg)]);
     } else if (Reg.isValid() && Reg.isVirtual()) {
+      // LiveInDef vreg def — gets its own variable (not shared).
       const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
       operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
-      RegVars[D].push_back({&M, M.NewIntVar(Dom)});
+      RegVars[{D, &M}] = M.NewIntVar(Dom);
     } else {
       // CopyOp def without a known register — unified domain.
-      RegVars[D].push_back({&M, M.NewIntVar(RegMemDomain)});
+      RegVars[{D, &M}] = M.NewIntVar(RegMemDomain);
+    }
+
+    // GlobalModel: per-boundary variable for cross-block vreg defs.
+    // LiveInDef defs get a GlobalLiveInVar entry.
+    if (UI->K == UnisonInstr::LiveInDef && Reg.isValid() &&
+        Reg.isVirtual()) {
+      const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
+      operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
+      sat::IntVar GVar = GlobalModel.NewIntVar(Dom);
+      RegVars[{D, &GlobalModel}] = GVar;
+      GlobalLiveInVar[{&UMBB, Reg}] = GVar;
     }
   }
 
-  // Uses: ChoiceVar.
+  // Uses: ChoiceVar (LocalModel only).
   for (UnisonUse *U : UI->Uses) {
     unsigned N = U->PotentialDefs.size();
     sat::IntVar CV = (N <= 1)
         ? M.NewConstant(0)
         : M.NewIntVar({0, static_cast<int64_t>(N - 1)});
-    ChoiceVars[U].push_back({&M, CV});
+    ChoiceVars[{U, &M}] = CV;
+
+    // GlobalModel: LiveOutUse uses of cross-block vregs get a
+    // GlobalLiveOutVar entry for congruence constraints.
+    Register Reg = U->Reg;
+    if (UI->K == UnisonInstr::LiveOutUse && Reg.isValid() &&
+        Reg.isVirtual()) {
+      const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
+      operations_research::Domain Dom = RCDomain[RC].UnionWith(MemDomain);
+      GlobalLiveOutVar[{&UMBB, Reg}] = GlobalModel.NewIntVar(Dom);
+    }
   }
 
-  // CopyOp: Ins variable.
+  // CopyOp: Ins variable (LocalModel only).
   if (UI->isCopyOp()) {
     unsigned N = UI->AltOpcodes.size();
     sat::IntVar IV = (N == 1)
         ? M.NewConstant(0)
         : M.NewIntVar({0, static_cast<int64_t>(N - 1)});
-    InsVars[UI].push_back({&M, IV});
+    InsVars[{UI, &M}] = IV;
   }
 }
 
-void Unison::createVariables(sat::CpModelBuilder &M) {
-  for (auto &UMBB : UFunc.MBBs) {
-    for (auto &UIP : UMBB->Instrs) {
-      createVariablesForInstr(UIP.get(), *UMBB, M);
-      nameAllVariablesInInstruction(UIP.get(), M);
-    }
-  }
-}
 
 // Check if a MachineInstr is rematerializable: cheap, no memory access,
 // all use operands are constants or always-available (e.g., $x0).
@@ -1159,37 +1221,23 @@ void Unison::copyExtend() {
   if (MemDomain.IsEmpty())
     return;
 
+  auto createCopyOp = [&](ArrayRef<unsigned> Opcodes) -> UnisonInstr * {
+    UnisonInstr *UI = allocateUnisonInstr(UnisonInstr::CopyOp, nullptr);
+    UI->AltOpcodes.assign(Opcodes.begin(), Opcodes.end());
+    UI->Uses.push_back(allocateUnisonUse(UI));
+    UI->Defs.push_back(allocateUnisonDef(UI));
+    return UI;
+  };
+
   for (auto &UMBB : UFunc.MBBs) {
-    // Build UnisonInstr* → list iterator map for in-place insertion.
-    DenseMap<UnisonInstr *, std::list<std::unique_ptr<UnisonInstr>>::iterator>
-        InstrToIter;
-    for (auto It = UMBB->Instrs.begin(); It != UMBB->Instrs.end(); ++It)
-      InstrToIter[It->get()] = It;
+    DenseSet<UnisonInstr *> ToSkip;
 
-    // Helper: create a CopyOp and insert it into the list at a position.
-    auto insertCopyOp = [&](std::list<std::unique_ptr<UnisonInstr>>::iterator Pos,
-                            ArrayRef<unsigned> Opcodes)
-        -> UnisonInstr * {
-      auto UInstr = allocateUnisonInstr(UnisonInstr::CopyOp, nullptr);
-      UInstr->AltOpcodes.assign(Opcodes.begin(), Opcodes.end());
-      // One use (reads from parent def), one def (output).
-      UInstr->Uses.push_back(allocateUnisonUse(UInstr.get()));
-      UInstr->Defs.push_back(allocateUnisonDef(UInstr.get()));
-      UnisonInstr *Ptr = UInstr.get();
-      auto NewIt = UMBB->Instrs.insert(Pos, std::move(UInstr));
-      InstrToIter[Ptr] = NewIt;
-      return Ptr;
-    };
+    for (UnisonInstr &Instr : UMBB->Instrs) {
+      if (ToSkip.contains(&Instr))
+        continue;
 
-    // Iterate over a snapshot of instructions (copy extension adds new
-    // entries, but we only process original ones).
-    SmallVector<UnisonInstr *, 32> OrigInstrs;
-    for (auto &UIP : UMBB->Instrs)
-      OrigInstrs.push_back(UIP.get());
-
-    for (UnisonInstr *UInstr : OrigInstrs) {
-      for (unsigned DefIdx = 0; DefIdx < UInstr->Defs.size(); ++DefIdx) {
-        UnisonDef *RealDef = UInstr->Defs[DefIdx];
+      for (unsigned DefIdx = 0; DefIdx < Instr.Defs.size(); ++DefIdx) {
+        UnisonDef *RealDef = Instr.Defs[DefIdx];
         if (RealDef->PotentialUses.empty())
           continue;
 
@@ -1197,17 +1245,17 @@ void Unison::copyExtend() {
 
         // --- Store-move: inserted right AFTER the def instruction ---
         SmallVector<unsigned, 3> SMOpcodes = {COPY_MOVE, COPY_STORE};
-        if (UInstr->K == UnisonInstr::LiveInDef)
+        if (Instr.K == UnisonInstr::LiveInDef)
           SMOpcodes.push_back(COPY_MEM);
-        auto DefIt = InstrToIter[UInstr];
-        auto AfterDef = std::next(DefIt);
-        UnisonInstr *StoreMove = insertCopyOp(AfterDef, SMOpcodes);
+        UnisonInstr *StoreMove = createCopyOp(SMOpcodes);
+        UMBB->insertAfter(&Instr, StoreMove);
+        ToSkip.insert(StoreMove);
         wireDefUse(RealDef, StoreMove->Uses[0]);
         UnisonDef *StoreMoveDef = StoreMove->Defs[0];
 
-        bool CanRemat = UInstr->K == UnisonInstr::RealInstr &&
-                        UInstr->RealMI &&
-                        isRematerializable(*UInstr->RealMI, *A.MRI);
+        bool CanRemat = Instr.K == UnisonInstr::RealInstr &&
+                        Instr.RealMI &&
+                        isRematerializable(*Instr.RealMI, *A.MRI);
 
         // --- Load-moves: inserted right BEFORE each real use ---
         for (unsigned UI = 0; UI < NumRealUses; ++UI) {
@@ -1217,10 +1265,11 @@ void Unison::copyExtend() {
           if (CanRemat)
             LoadOpcodes.push_back(COPY_REMAT);
 
-          auto UseIt = InstrToIter[RealUse->Parent];
-          UnisonInstr *LoadMove = insertCopyOp(UseIt, LoadOpcodes);
+          UnisonInstr *LoadMove = createCopyOp(LoadOpcodes);
+          UMBB->insertBefore(RealUse->Parent, LoadMove);
+          ToSkip.insert(LoadMove);
           if (CanRemat)
-            RematMIs[LoadMove] = UInstr->RealMI;
+            RematMIs[LoadMove] = Instr.RealMI;
           wireDefUse(StoreMoveDef, LoadMove->Uses[0]);
           UnisonDef *LoadMoveDef = LoadMove->Defs[0];
 
@@ -1240,171 +1289,155 @@ void Unison::copyExtend() {
   }
 }
 
-void Unison::addCongruenceConstraints() {
-  // For each CFG edge (pred → succ), for each value live across the edge,
-  // constrain: the register chosen by pred's exit operand must equal
-  // succ's entry operand register.
-  //
-  // The exit operand (in LiveOutUse) has a ChoiceVar selecting among
-  // PotentialDefs. Whichever def is chosen, its Reg.Var must equal the
-  // corresponding entry def's Reg.Var in the successor's LiveInDef.
+// Congruence is explicit: each boundary (LiveInDef, LiveOutUse) of a
+// cross-block vreg gets its own GlobalModel variable. addGlobalConstraints
+// links them across CFG edges: LiveOut(pred) == LiveIn(succ).
+// The iteration loop (Step 6) fixes boundary register values from
+// GlobalModel solutions into LocalModels.
 
-  // Build a map from MBB -> its LiveInDef and LiveOutUse instructions.
-  DenseMap<MachineBasicBlock *, UnisonInstr *> MBBLiveIn, MBBLiveOut;
-  for (auto &UMBB : UFunc.MBBs) {
-    for (auto &UI : UMBB->Instrs) {
-      if (UI->K == UnisonInstr::LiveInDef)
-        MBBLiveIn[UMBB->MBB] = UI.get();
-      else if (UI->K == UnisonInstr::LiveOutUse)
-        MBBLiveOut[UMBB->MBB] = UI.get();
-    }
-  }
-
-  // We need to match exit use operands to entry def operands by register.
-  // Both getDefsFromUnisonInstr (for LiveInDef) and getUsesFromUnisonInstr
-  // (for LiveOutUse) return registers in the same order for the same set
-  // of live values. We iterate them in lockstep.
-  for (auto &UMBB : UFunc.MBBs) {
-    UnisonInstr *LiveOut = MBBLiveOut[UMBB->MBB];
-    if (!LiveOut)
-      continue;
-
-    SmallVector<Register> ExitUseRegs;
-    getUsesFromUnisonInstr(LiveOut, *UMBB->MBB, ExitUseRegs);
-
-    for (MachineBasicBlock *Succ : UMBB->MBB->successors()) {
-      UnisonInstr *LiveIn = MBBLiveIn[Succ];
-      if (!LiveIn)
-        continue;
-
-      SmallVector<Register> EntryDefRegs;
-      getDefsFromUnisonInstr(LiveIn, *Succ, EntryDefRegs);
-
-      // Match exit uses to entry defs by register.
-      for (unsigned EI = 0, EE = ExitUseRegs.size(); EI < EE; ++EI) {
-        Register ExitReg = ExitUseRegs[EI];
-        for (unsigned DI = 0, DE = EntryDefRegs.size(); DI < DE; ++DI) {
-          if (EntryDefRegs[DI] != ExitReg)
-            continue;
-
-          UnisonUse *ExitUse = LiveOut->Uses[EI];
-          UnisonDef *EntryDef = LiveIn->Defs[DI];
-
-          for (unsigned K = 0, KE = ExitUse->PotentialDefs.size(); K < KE;
-               ++K) {
-            UnisonDef *ChosenDef = ExitUse->PotentialDefs[K];
-            sat::BoolVar Chosen = getDChosenInU(Model, ChosenDef, ExitUse);
-            Model.AddEquality(getRegVar(ChosenDef, Model),
-                              getRegVar(EntryDef, Model))
-                .OnlyEnforceIf(Chosen);
-          }
-          break;
-        }
-      }
-    }
-  }
-}
-
-sat::BoolVar Unison::reifyEquality(sat::IntVar Var, int64_t Value) {
-  sat::BoolVar B = Model.NewBoolVar();
-  Model.AddEquality(Var, Value).OnlyEnforceIf(B);
-  Model.AddNotEqual(Var, Value).OnlyEnforceIf(~B);
+sat::BoolVar Unison::reifyEquality(sat::IntVar Var, int64_t Value,
+                                   sat::CpModelBuilder &M) {
+  sat::BoolVar B = M.NewBoolVar();
+  M.AddEquality(Var, Value).OnlyEnforceIf(B);
+  M.AddNotEqual(Var, Value).OnlyEnforceIf(~B);
   return B;
 }
 
-sat::BoolVar Unison::reifyNotEqual(sat::IntVar A, sat::IntVar B) {
-  sat::BoolVar NE = Model.NewBoolVar();
-  Model.AddNotEqual(A, B).OnlyEnforceIf(NE);
-  Model.AddEquality(A, B).OnlyEnforceIf(~NE);
+sat::BoolVar Unison::reifyNotEqual(sat::IntVar A, sat::IntVar B,
+                                   sat::CpModelBuilder &M) {
+  sat::BoolVar NE = M.NewBoolVar();
+  M.AddNotEqual(A, B).OnlyEnforceIf(NE);
+  M.AddEquality(A, B).OnlyEnforceIf(~NE);
   return NE;
 }
 
-sat::BoolVar Unison::reifyAnd(sat::BoolVar X, sat::BoolVar Y) {
-  sat::BoolVar R = Model.NewBoolVar();
-  Model.AddBoolAnd({X, Y}).OnlyEnforceIf(R);
-  Model.AddBoolOr({~X, ~Y}).OnlyEnforceIf(~R);
+sat::BoolVar Unison::reifyAnd(sat::BoolVar X, sat::BoolVar Y,
+                              sat::CpModelBuilder &M) {
+  sat::BoolVar R = M.NewBoolVar();
+  M.AddBoolAnd({X, Y}).OnlyEnforceIf(R);
+  M.AddBoolOr({~X, ~Y}).OnlyEnforceIf(~R);
   return R;
 }
 
 void Unison::restrictToDomain(sat::IntVar Var,
-                              const operations_research::Domain &Dom) {
-  const auto &VarProto = Model.Proto().variables(Var.index());
+                              const operations_research::Domain &Dom,
+                              sat::CpModelBuilder &M) {
+  const auto &VarProto = M.Proto().variables(Var.index());
   if (VarProto.domain_size() == 2 && VarProto.domain(0) == VarProto.domain(1))
     return;
   // CP-SAT: restrict variable to domain by adding it as a linear constraint.
-  Model.AddLinearConstraint(Var, Dom);
+  M.AddLinearConstraint(Var, Dom);
 }
 
 void Unison::restrictToDomain(sat::IntVar Var,
                               const operations_research::Domain &Dom,
-                              sat::BoolVar Condition) {
-  const auto &VarProto = Model.Proto().variables(Var.index());
+                              sat::BoolVar Condition,
+                              sat::CpModelBuilder &M) {
+  const auto &VarProto = M.Proto().variables(Var.index());
   if (VarProto.domain_size() == 2 && VarProto.domain(0) == VarProto.domain(1))
     return;
-  Model.AddLinearConstraint(Var, Dom).OnlyEnforceIf(Condition);
+  M.AddLinearConstraint(Var, Dom).OnlyEnforceIf(Condition);
 }
 
 void Unison::addConstraints() {
-  for (auto &UMBB : UFunc.MBBs) {
-    addRegAllocConstraints(*UMBB);
-    addSchedConstraints(*UMBB);
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+    sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+    addRegAllocConstraints(*UFunc.MBBs[MBBIdx], LM);
+    addSchedConstraints(*UFunc.MBBs[MBBIdx], LM);
   }
-  addCongruenceConstraints();
-  addLiveInDefLinkConstraints();
+  addGlobalConstraints();
 }
 
-// LiveInDef defs have their own Reg.Var (unified domain) to allow
-// cross-block spilling. When a LiveInDef receives a register value
-// (not memory), it must be the SAME register as the vreg's shared
-// Reg.Var (used by real instruction defs within the block).
-void Unison::addLiveInDefLinkConstraints() {
-  for (auto &UMBB : UFunc.MBBs) {
-    for (auto &UIP : UMBB->Instrs) {
-      if (UIP->K != UnisonInstr::LiveInDef)
+// ---------------------------------------------------------------------------
+// Global constraints (cross-MBB)
+// ---------------------------------------------------------------------------
+//
+// Congruence: for each CFG edge MBB0→MBB1 and each cross-block vreg
+// live across that edge, the LiveOut variable in MBB0 must equal the
+// LiveIn variable in MBB1.
+//
+// Interference is left to the local models (NoOverlap2D). If the
+// global assignment causes a local infeasibility, the iteration loop
+// (Step 6) will add a nogood to the GlobalModel.
+
+void Unison::addGlobalConstraints() {
+  // Congruence: for each CFG edge, link LiveOut to LiveIn.
+  // For each MBB's live-out vregs, match against each successor's live-in.
+  for (auto &[Key, OutVar] : GlobalLiveOutVar) {
+    auto *UMBB = Key.first;
+    Register Reg = Key.second;
+
+    for (MachineBasicBlock *Succ : UMBB->MBB->successors()) {
+      UnisonMBB *SuccUMBB = UFunc.getUMBB(Succ);
+      auto InIt = GlobalLiveInVar.find({SuccUMBB, Reg});
+      if (InIt == GlobalLiveInVar.end())
         continue;
-      SmallVector<Register> DefRegs;
-      getDefsFromUnisonInstr(UIP.get(), *UMBB->MBB, DefRegs);
-      for (unsigned I = 0, E = DefRegs.size(); I < E; ++I) {
-        Register Reg = DefRegs[I];
-        if (!Reg.isVirtual())
-          continue;
-        auto It = VRegToPhysRegVar.find(Reg);
-        if (It == VRegToPhysRegVar.end())
-          continue;
-        sat::IntVar SharedVar = It->second;
-        sat::IntVar LiveInVar = getRegVar(UIP->Defs[I], Model);
-        // When LiveInDef is in register domain (not memory),
-        // it must match the shared vreg register.
-        sat::BoolVar InRegDomain = Model.NewBoolVar();
-        const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
-        restrictToDomain(LiveInVar, RCDomain[RC], InRegDomain);
-        restrictToDomain(LiveInVar, MemDomain, ~InRegDomain);
-        Model.AddEquality(LiveInVar, SharedVar).OnlyEnforceIf(InRegDomain);
-      }
+      GlobalModel.AddEquality(OutVar, InIt->second);
     }
   }
+
+  // Boundary interference: at each boundary point, all live registers
+  // (virtual + physical) must be assigned distinct values.
+  auto addBoundaryRegConstraints = [&](UnisonMBB *UMBB,
+                                     ArrayRef<Register> Regs,
+                                     const DenseMap<BoundaryKey, sat::IntVar> &VarMap) {
+    SmallVector<sat::IntVar, 16> LiveVars;
+    for (Register Reg : Regs) {
+      if (!Reg.isValid())
+        continue;
+      if (Reg.isVirtual()) {
+        auto It = VarMap.find({UMBB, Reg});
+        if (It != VarMap.end())
+          LiveVars.push_back(It->second);
+      } else if (MCRegToIdx.count(MCRegister(Reg))) {
+        LiveVars.push_back(
+            GlobalModel.NewConstant(MCRegToIdx[MCRegister(Reg)]));
+      }
+    }
+    if (LiveVars.size() > 1)
+      GlobalModel.AddAllDifferent(LiveVars);
+  };
+
+  for (auto &UMBB : UFunc.MBBs) {
+    // Collect registers from boundary instruction operands.
+    SmallVector<Register, 16> LiveInRegs, LiveOutRegs;
+    for (UnisonDef *D : UMBB->getLiveIn()->Defs)
+      LiveInRegs.push_back(D->Reg);
+    for (UnisonUse *U : UMBB->getLiveOut()->Uses)
+      LiveOutRegs.push_back(U->Reg);
+
+    addBoundaryRegConstraints(UMBB.get(), LiveInRegs, GlobalLiveInVar);
+    addBoundaryRegConstraints(UMBB.get(), LiveOutRegs, GlobalLiveOutVar);
+  }
+
+  LLVM_DEBUG(dbgs() << "  GlobalModel: " << GlobalLiveInVar.size()
+                    << " live-in vars, " << GlobalLiveOutVar.size()
+                    << " live-out vars, "
+                    << GlobalModel.Proto().constraints_size()
+                    << " constraints\n");
 }
 
 // ---------------------------------------------------------------------------
 // Register allocation constraints (per MBB)
 // ---------------------------------------------------------------------------
 
-void Unison::addRegAllocConstraints(UnisonMBB &UMBB) {
+void Unison::addRegAllocConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
   // Activation must be computed before NoOverlap (which uses IsActiveVar).
-  deriveActivationVars(UMBB);
-  addRegClassConstraints(UMBB);
-  addNoOverlapConstraints(UMBB);
+  deriveActivationVars(UMBB, M);
+  addRegClassConstraints(UMBB, M);
+  addNoOverlapConstraints(UMBB, M);
 }
 
 sat::IntVar Unison::getDefLastUseCycle(UnisonInstr *UInstr,
                                           unsigned DefIdx,
-                                          int IssueCycleUB) {
+                                          int IssueCycleUB,
+                                          sat::CpModelBuilder &M) {
   UnisonDef *DefOp = UInstr->Defs[DefIdx];
 
   if (DefOp->PotentialUses.empty()) {
     // Dead def (e.g., regmask clobber): the definer's IC is the only
     // time point. Caller adds +1 for the minimal half-open rectangle.
-    return getICVar(UInstr, Model);
+    return getICVar(UInstr, M);
   }
 
   // LastUseCycle = max over active uses of IssueCycle(use_instr).
@@ -1413,24 +1446,24 @@ sat::IntVar Unison::getDefLastUseCycle(UnisonInstr *UInstr,
   // (so that the rectangle always has at least size 1).
   std::vector<sat::IntVar> UseCycleVars;
   for (UnisonUse *U : DefOp->PotentialUses) {
-    sat::IntVar UseCycle = Model.NewIntVar({0, IssueCycleUB});
-    sat::BoolVar Active = getDActiveInU(Model, UInstr->Defs[DefIdx], U);
-    Model.AddEquality(UseCycle, getICVar(U->Parent, Model)).OnlyEnforceIf(Active);
-    Model.AddEquality(UseCycle, getICVar(UInstr, Model)).OnlyEnforceIf(~Active);
+    sat::IntVar UseCycle = M.NewIntVar({0, IssueCycleUB});
+    sat::BoolVar Active = getDActiveInU(M, UInstr->Defs[DefIdx], U);
+    M.AddEquality(UseCycle, getICVar(U->Parent, M)).OnlyEnforceIf(Active);
+    M.AddEquality(UseCycle, getICVar(UInstr, M)).OnlyEnforceIf(~Active);
     UseCycleVars.push_back(UseCycle);
   }
 
-  sat::IntVar MaxUseCycle = Model.NewIntVar({0, IssueCycleUB});
+  sat::IntVar MaxUseCycle = M.NewIntVar({0, IssueCycleUB});
   std::vector<sat::LinearExpr> Exprs(UseCycleVars.begin(), UseCycleVars.end());
-  Model.AddMaxEquality(MaxUseCycle, Exprs);
+  M.AddMaxEquality(MaxUseCycle, Exprs);
   return MaxUseCycle;
 }
 
-void Unison::addNoOverlapConstraints(UnisonMBB &UMBB) {
-  UMBB.NoOverlap.emplace(Model.AddNoOverlap2D());
+void Unison::addNoOverlapConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
+  UMBB.NoOverlap.emplace(M.AddNoOverlap2D());
 
   for (auto &UInstrPtr : UMBB.Instrs) {
-    UnisonInstr *UInstr = UInstrPtr.get();
+    UnisonInstr *UInstr = &UInstrPtr;
 
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
       UnisonDef *DefOp = UInstr->Defs[DI];
@@ -1440,23 +1473,23 @@ void Unison::addNoOverlapConstraints(UnisonMBB &UMBB) {
       // in the pipeline. For a 2-stage pipeline (latency=2), this is IC+1.
       // TODO: generalize to per-instruction latencies for real pipelines.
       static constexpr int PipelineLatency = 2;
-      sat::IntVar TimeStart = Model.NewIntVar({0, UB + PipelineLatency});
-      Model.AddEquality(TimeStart,
-                         getICVar(UInstr, Model) + (PipelineLatency - 1));
+      sat::IntVar TimeStart = M.NewIntVar({0, UB + PipelineLatency});
+      M.AddEquality(TimeStart,
+                         getICVar(UInstr, M) + (PipelineLatency - 1));
 
-      sat::IntVar LastUseCycle = getDefLastUseCycle(UInstr, DI, UB);
+      sat::IntVar LastUseCycle = getDefLastUseCycle(UInstr, DI, UB, M);
       // TimeEnd = max(TimeStart + 1, LastUseCycle + 1).
-      sat::IntVar TimeEnd = Model.NewIntVar({0, UB + 2});
-      sat::IntVar MinEnd = Model.NewIntVar({0, UB + 2});
-      Model.AddEquality(MinEnd, TimeStart + 1);
-      Model.AddMaxEquality(TimeEnd,
+      sat::IntVar TimeEnd = M.NewIntVar({0, UB + 2});
+      sat::IntVar MinEnd = M.NewIntVar({0, UB + 2});
+      M.AddEquality(MinEnd, TimeStart + 1);
+      M.AddMaxEquality(TimeEnd,
                            {sat::LinearExpr(MinEnd),
                             sat::LinearExpr(LastUseCycle) + 1});
 
-      sat::IntVar TimeSize = Model.NewIntVar({1, UB + 2});
-      Model.AddEquality(TimeSize, TimeEnd - TimeStart);
+      sat::IntVar TimeSize = M.NewIntVar({1, UB + 2});
+      M.AddEquality(TimeSize, TimeEnd - TimeStart);
 
-      addRectangle(UMBB, UInstr, getRegVar(DefOp, Model), TimeStart, TimeSize, TimeEnd);
+      addRectangle(UMBB, UInstr, getRegVar(DefOp, M), TimeStart, TimeSize, TimeEnd, M);
     }
   }
 }
@@ -1464,87 +1497,80 @@ void Unison::addNoOverlapConstraints(UnisonMBB &UMBB) {
 void Unison::addRectangle(UnisonMBB &UMBB, UnisonInstr *UInstr,
                           sat::IntVar RegVar,
                           sat::IntVar TimeStart, sat::IntVar TimeSize,
-                          sat::IntVar TimeEnd) {
+                          sat::IntVar TimeEnd, sat::CpModelBuilder &M) {
   if (UInstr->isCopyOp()) {
     // CopyOp rectangles only participate in NoOverlap2D when active.
     // Inactive copies don't occupy any register or time slot.
     auto ActiveIt = IsActiveVar.find(UInstr);
     assert(ActiveIt != IsActiveVar.end() && "CopyOp missing IsActiveVar");
     sat::IntervalVar TimeAxis =
-        Model.NewOptionalIntervalVar(TimeStart, TimeSize, TimeEnd,
+        M.NewOptionalIntervalVar(TimeStart, TimeSize, TimeEnd,
                                      ActiveIt->second);
     sat::IntervalVar RegAxis =
-        Model.NewOptionalFixedSizeIntervalVar(RegVar, 1, ActiveIt->second);
+        M.NewOptionalFixedSizeIntervalVar(RegVar, 1, ActiveIt->second);
     UMBB.NoOverlap->AddRectangle(RegAxis, TimeAxis);
   } else {
     sat::IntervalVar TimeAxis =
-        Model.NewIntervalVar(TimeStart, TimeSize, TimeEnd);
+        M.NewIntervalVar(TimeStart, TimeSize, TimeEnd);
     sat::IntervalVar RegAxis =
-        Model.NewFixedSizeIntervalVar(RegVar, 1);
+        M.NewFixedSizeIntervalVar(RegVar, 1);
     UMBB.NoOverlap->AddRectangle(RegAxis, TimeAxis);
   }
 }
 
-void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
+void Unison::addRegClassConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
   operations_research::Domain PhysRegDomain(0, NumPhysRegs - 1);
 
   for (auto &UInstrPtr : UMBB.Instrs) {
-    UnisonInstr *UInstr = UInstrPtr.get();
+    UnisonInstr *UInstr = &UInstrPtr;
 
     // --- Def-side constraints ---
     // RealInstr defs: restrict to register class + memory domain.
     if (UInstr->K == UnisonInstr::RealInstr) {
-      SmallVector<Register> DefRegs;
-      getDefsFromUnisonInstr(UInstr, *UMBB.MBB, DefRegs);
-      for (unsigned DI = 0; DI < UInstr->Defs.size() && DI < DefRegs.size(); ++DI) {
-        Register Reg = DefRegs[DI];
-        if (Reg.isVirtual()) {
-          const TargetRegisterClass *RC = A.MRI->getRegClass(Reg);
-          restrictToDomain(getRegVar(UInstr->Defs[DI], Model),
-                           RCDomain[RC].UnionWith(MemDomain));
+      for (UnisonDef *D : UInstr->Defs) {
+        if (D->Reg.isVirtual()) {
+          const TargetRegisterClass *RC = A.MRI->getRegClass(D->Reg);
+          restrictToDomain(getRegVar(D, M),
+                           RCDomain[RC].UnionWith(MemDomain), M);
         }
       }
     } else if (UInstr->isCopyOp()) {
       UnisonDef *DefOp = UInstr->Defs[0];
-      sat::IntVar DefReg = getRegVar(DefOp, Model);
+      sat::IntVar DefReg = getRegVar(DefOp, M);
 
       for (unsigned I = 0; I < UInstr->AltOpcodes.size(); ++I) {
-        sat::BoolVar InsIsI = reifyEquality(getInsVar(UInstr, Model), I);
+        sat::BoolVar InsIsI = reifyEquality(getInsVar(UInstr, M), I, M);
         unsigned Opcode = UInstr->AltOpcodes[I];
         if (Opcode == COPY_STORE || Opcode == COPY_MEM)
-          restrictToDomain(DefReg, MemDomain, InsIsI);
+          restrictToDomain(DefReg, MemDomain, InsIsI, M);
         else
-          restrictToDomain(DefReg, PhysRegDomain, InsIsI);
+          restrictToDomain(DefReg, PhysRegDomain, InsIsI, M);
       }
     }
 
     // --- Use-side constraints: propagate source domain from uses to defs ---
-    // For each def, intersect its domain with the requirements of all its
-    // users. A real instruction use requires its source in register domain.
-    // A CopyOp use's requirement depends on the instruction alternative.
-    // A LiveOutUse has no restriction (synthetic, can accept register or memory).
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
       UnisonDef *DefOp = UInstr->Defs[DI];
-      sat::IntVar DefReg = getRegVar(DefOp, Model);
+      sat::IntVar DefReg = getRegVar(DefOp, M);
 
       for (UnisonUse *U : DefOp->PotentialUses) {
         UnisonInstr *User = U->Parent;
-        sat::BoolVar Chosen = getDChosenInU(Model, UInstr->Defs[DI], U);
+        sat::BoolVar Chosen = getDChosenInU(M, UInstr->Defs[DI], U);
 
         if (User->K == UnisonInstr::RealInstr) {
           // Real instructions read from registers only.
-          restrictToDomain(DefReg, PhysRegDomain, Chosen);
+          restrictToDomain(DefReg, PhysRegDomain, Chosen, M);
 
         } else if (User->isCopyOp()) {
           // CopyOp source requirement depends on instruction alternative.
           for (unsigned I = 0; I < User->AltOpcodes.size(); ++I) {
-            sat::BoolVar InsIsI = reifyEquality(getInsVar(User, Model), I);
-            sat::BoolVar Both = reifyAnd(Chosen, InsIsI);
+            sat::BoolVar InsIsI = reifyEquality(getInsVar(User, M), I, M);
+            sat::BoolVar Both = reifyAnd(Chosen, InsIsI, M);
             unsigned Opcode = User->AltOpcodes[I];
             if (Opcode == COPY_LOAD || Opcode == COPY_MEM) {
-              restrictToDomain(DefReg, MemDomain, Both);
+              restrictToDomain(DefReg, MemDomain, Both, M);
             } else if (Opcode == COPY_STORE || Opcode == COPY_MOVE) {
-              restrictToDomain(DefReg, PhysRegDomain, Both);
+              restrictToDomain(DefReg, PhysRegDomain, Both, M);
             }
             // COPY_REMAT: no source constraint (rematerialized).
           }
@@ -1558,11 +1584,12 @@ void Unison::addRegClassConstraints(UnisonMBB &UMBB) {
 // Compute activation for a single def operand. Returns TrueVar if
 // trivially always active, FalseVar if no uses, or a BoolVar for
 // the OR of DActiveInU over all potential uses.
-sat::BoolVar Unison::deriveDefActivation(UnisonInstr *UInstr, unsigned DI) {
+sat::BoolVar Unison::deriveDefActivation(UnisonInstr *UInstr, unsigned DI,
+                                         sat::CpModelBuilder &M) {
   UnisonDef *DefOp = UInstr->Defs[DI];
 
   if (DefOp->PotentialUses.empty())
-    return Model.FalseVar();
+    return M.FalseVar();
 
   SmallVector<sat::BoolVar, 4> ActiveBools;
 
@@ -1572,56 +1599,56 @@ sat::BoolVar Unison::deriveDefActivation(UnisonInstr *UInstr, unsigned DI) {
 
     // Short-circuit: unconditionally chosen + always-active use.
     if (SingleChoice && UseAlwaysActive)
-      return Model.TrueVar();
+      return M.TrueVar();
 
-    ActiveBools.push_back(getDActiveInU(Model, UInstr->Defs[DI], U));
+    ActiveBools.push_back(getDActiveInU(M, UInstr->Defs[DI], U));
   }
 
   if (ActiveBools.empty())
-    return Model.FalseVar();
+    return M.FalseVar();
   if (ActiveBools.size() == 1)
     return ActiveBools[0];
 
-  sat::BoolVar Active = Model.NewBoolVar();
+  sat::BoolVar Active = M.NewBoolVar();
   for (sat::BoolVar B : ActiveBools)
-    Model.AddImplication(B, Active);
-  Model.AddBoolOr(ActiveBools).OnlyEnforceIf(Active);
+    M.AddImplication(B, Active);
+  M.AddBoolOr(ActiveBools).OnlyEnforceIf(Active);
   std::vector<sat::BoolVar> NegBools;
   for (sat::BoolVar B : ActiveBools)
     NegBools.push_back(~B);
-  Model.AddBoolAnd(NegBools).OnlyEnforceIf(~Active);
+  M.AddBoolAnd(NegBools).OnlyEnforceIf(~Active);
   return Active;
 }
 
-void Unison::deriveActivationVars(UnisonMBB &UMBB) {
+void Unison::deriveActivationVars(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
   // Process in reverse order: load-moves before store-moves, so that
   // IsActiveVar is available for nested activation (store-move activation
   // depends on load-move activation).
   for (auto It = UMBB.Instrs.rbegin(); It != UMBB.Instrs.rend(); ++It) {
-    UnisonInstr *UInstr = It->get();
+    UnisonInstr *UInstr = &*It;
     if (!UInstr->isCopyOp())
       continue;
 
     // Instruction is active if any of its defs is active.
     SmallVector<sat::BoolVar, 2> DefActives;
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
-      sat::BoolVar DA = deriveDefActivation(UInstr, DI);
+      sat::BoolVar DA = deriveDefActivation(UInstr, DI, M);
       DefActives.push_back(DA);
     }
 
     if (DefActives.empty()) {
-      IsActiveVar[UInstr] = Model.FalseVar();
+      IsActiveVar[UInstr] = M.FalseVar();
     } else if (DefActives.size() == 1) {
       IsActiveVar[UInstr] = DefActives[0];
     } else {
-      sat::BoolVar Active = Model.NewBoolVar();
+      sat::BoolVar Active = M.NewBoolVar();
       for (sat::BoolVar B : DefActives)
-        Model.AddImplication(B, Active);
-      Model.AddBoolOr(DefActives).OnlyEnforceIf(Active);
+        M.AddImplication(B, Active);
+      M.AddBoolOr(DefActives).OnlyEnforceIf(Active);
       std::vector<sat::BoolVar> NegBools;
       for (sat::BoolVar B : DefActives)
         NegBools.push_back(~B);
-      Model.AddBoolAnd(NegBools).OnlyEnforceIf(~Active);
+      M.AddBoolAnd(NegBools).OnlyEnforceIf(~Active);
       IsActiveVar[UInstr] = Active;
     }
     NS.nameActiveVar(UInstr, IsActiveVar[UInstr]);
@@ -1632,27 +1659,28 @@ void Unison::deriveActivationVars(UnisonMBB &UMBB) {
 // Scheduling constraints (per MBB)
 // ---------------------------------------------------------------------------
 
-void Unison::addSchedConstraints(UnisonMBB &UMBB) {
+void Unison::addSchedConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
   // When UnisonPreserveOrder is set, chain consecutive real instructions
   // in program order to preserve the original schedule.
   if (UnisonPreserveOrder) {
     UnisonInstr *Prev = nullptr;
     for (auto &UIP : UMBB.Instrs) {
-      if (UIP->K != UnisonInstr::RealInstr)
+      if (UIP.K != UnisonInstr::RealInstr)
         continue;
-      UnisonInstr *Cur = UIP.get();
+      UnisonInstr *Cur = &UIP;
       if (!Prev)
-        Prev = UMBB.Instrs.front().get(); // LiveInDef
-      Model.AddLessThan(getICVar(Prev, Model), getICVar(Cur, Model));
+        Prev = UMBB.getLiveIn();
+      M.AddLessThan(getICVar(Prev, M), getICVar(Cur, M));
       Prev = Cur;
     }
   }
-  addDataDependencyConstraints(UMBB);
-  addAntiDependencyConstraints(UMBB);
-  addOrderingConstraints(UMBB);
+  addDataDependencyConstraints(UMBB, M);
+  addAntiDependencyConstraints(UMBB, M);
+  addOrderingConstraints(UMBB, M);
 }
 
-void Unison::addDataDependencyConstraints(UnisonMBB &UMBB) {
+void Unison::addDataDependencyConstraints(UnisonMBB &UMBB,
+                                          sat::CpModelBuilder &M) {
   // Latency = 2 for the 2-stage pipeline: a def at IC=K writes at
   // stage 1 (time K+1). A use must be at IC >= K+2 so it reads at
   // stage 0 (time K+2), one time unit after the write completes.
@@ -1661,19 +1689,20 @@ void Unison::addDataDependencyConstraints(UnisonMBB &UMBB) {
   // // TODO: generalize latency per instruction for real pipeline models.
   static constexpr int Latency = 2;
   for (auto &UInstrPtr : UMBB.Instrs) {
-    UnisonInstr *UInstr = UInstrPtr.get();
+    UnisonInstr *UInstr = &UInstrPtr;
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
       for (UnisonUse *U : UInstr->Defs[DI]->PotentialUses) {
-        sat::BoolVar Chosen = getDChosenInU(Model, UInstr->Defs[DI], U);
-        Model.AddGreaterOrEqual(getICVar(U->Parent, Model),
-                                getICVar(UInstr, Model) + Latency)
+        sat::BoolVar Chosen = getDChosenInU(M, UInstr->Defs[DI], U);
+        M.AddGreaterOrEqual(getICVar(U->Parent, M),
+                                getICVar(UInstr, M) + Latency)
             .OnlyEnforceIf(Chosen);
       }
     }
   }
 }
 
-void Unison::addAntiDependencyConstraints(UnisonMBB &UMBB) {
+void Unison::addAntiDependencyConstraints(UnisonMBB &UMBB,
+                                          sat::CpModelBuilder &M) {
   // WAR (Write After Read) anti-dependencies: if instruction A reads
   // a register variable V, and a later instruction B (in original order)
   // defines the same variable V, then IC(A) < IC(B).
@@ -1687,18 +1716,18 @@ void Unison::addAntiDependencyConstraints(UnisonMBB &UMBB) {
   DenseMap<int, SmallVector<UnisonInstr *, 4>> ReadersOfVar;
 
   for (auto &UInstrPtr : UMBB.Instrs) {
-    UnisonInstr *UInstr = UInstrPtr.get();
+    UnisonInstr *UInstr = &UInstrPtr;
 
     // First: check defs against prior readers (anti-dependency).
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
-      int VarIdx = getRegVar(UInstr->Defs[DI], Model).index();
+      int VarIdx = getRegVar(UInstr->Defs[DI], M).index();
       auto It = ReadersOfVar.find(VarIdx);
       if (It != ReadersOfVar.end()) {
         for (UnisonInstr *Reader : It->second) {
           if (Reader == UInstr)
             continue;
           // TODO: only add antidependency if both instructions are active.
-          Model.AddLessOrEqual(getICVar(Reader, Model), getICVar(UInstr, Model));
+          M.AddLessOrEqual(getICVar(Reader, M), getICVar(UInstr, M));
         }
       }
     }
@@ -1710,14 +1739,14 @@ void Unison::addAntiDependencyConstraints(UnisonMBB &UMBB) {
     for (unsigned UI = 0; UI < UInstr->Uses.size(); ++UI) {
       UnisonUse *UseOp = UInstr->Uses[UI];
       for (UnisonDef *SrcDef : UseOp->PotentialDefs) {
-        int VarIdx = getRegVar(SrcDef, Model).index();
+        int VarIdx = getRegVar(SrcDef, M).index();
         ReadersOfVar[VarIdx].push_back(UInstr);
       }
     }
   }
 }
 
-void Unison::addOrderingConstraints(UnisonMBB &UMBB) {
+void Unison::addOrderingConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
   // Ordering constraints partition the MBB into regions separated by
   // scheduling barriers (isSchedulingBoundary: stores, calls, SP mods,
   // terminators). Within a region, pure instructions may be freely
@@ -1744,7 +1773,7 @@ void Unison::addOrderingConstraints(UnisonMBB &UMBB) {
   // CopyOps and other non-barrier instructions are pure — they must
   // stay within their barrier region.
   for (auto &UIP : UMBB.Instrs) {
-    UnisonInstr *UI = UIP.get();
+    UnisonInstr *UI = &UIP;
     if (UI->K == UnisonInstr::LiveInDef || UI->K == UnisonInstr::LiveOutUse)
       continue;
 
@@ -1754,22 +1783,22 @@ void Unison::addOrderingConstraints(UnisonMBB &UMBB) {
     if (IsBarrier) {
       // This barrier must come after all instructions since the last barrier.
       if (!ICsSinceLastBarrier.empty()) {
-        sat::IntVar MaxPrev = Model.NewIntVar({0, UB});
+        sat::IntVar MaxPrev = M.NewIntVar({0, UB});
         std::vector<sat::LinearExpr> Exprs(ICsSinceLastBarrier.begin(),
                                             ICsSinceLastBarrier.end());
-        Model.AddMaxEquality(MaxPrev, Exprs);
-        Model.AddGreaterThan(getICVar(UI, Model), MaxPrev);
+        M.AddMaxEquality(MaxPrev, Exprs);
+        M.AddGreaterThan(getICVar(UI, M), MaxPrev);
       } else if (HaveBarrier) {
-        Model.AddGreaterThan(getICVar(UI, Model), LastBarrierIC);
+        M.AddGreaterThan(getICVar(UI, M), LastBarrierIC);
       }
-      LastBarrierIC = getICVar(UI, Model);
+      LastBarrierIC = getICVar(UI, M);
       HaveBarrier = true;
       ICsSinceLastBarrier.clear();
     } else {
       // Pure instruction (including CopyOps): must come after the last barrier.
       if (HaveBarrier)
-        Model.AddGreaterThan(getICVar(UI, Model), LastBarrierIC);
-      ICsSinceLastBarrier.push_back(getICVar(UI, Model));
+        M.AddGreaterThan(getICVar(UI, M), LastBarrierIC);
+      ICsSinceLastBarrier.push_back(getICVar(UI, M));
     }
   }
 
@@ -1779,69 +1808,69 @@ void Unison::addOrderingConstraints(UnisonMBB &UMBB) {
     AllPrevICs.push_back(LastBarrierIC);
 
   if (!AllPrevICs.empty()) {
-    sat::IntVar MaxAll = Model.NewIntVar({0, UB});
+    sat::IntVar MaxAll = M.NewIntVar({0, UB});
     std::vector<sat::LinearExpr> Exprs(AllPrevICs.begin(), AllPrevICs.end());
-    Model.AddMaxEquality(MaxAll, Exprs);
+    M.AddMaxEquality(MaxAll, Exprs);
     for (auto &UIP : UMBB.Instrs) {
-      if (UIP->K == UnisonInstr::LiveOutUse)
-        Model.AddGreaterThan(getICVar(UIP.get(), Model), MaxAll);
+      if (UIP.K == UnisonInstr::LiveOutUse)
+        M.AddGreaterThan(getICVar(&UIP, M), MaxAll);
     }
   }
 }
 
-sat::BoolVar Unison::getIsNotIdentityCopy(UnisonInstr *UInstr) {
+sat::BoolVar Unison::getIsNotIdentityCopy(UnisonInstr *UInstr,
+                                          sat::CpModelBuilder &M) {
   // TODO: what if copy has several defs feeding into it?
   UnisonUse *UseOp = UInstr->Uses[0];
   assert(!UseOp->PotentialDefs.empty());
   UnisonDef *SrcDef = UseOp->PotentialDefs[0];
-  return reifyNotEqual(getRegVar(SrcDef, Model),
-                       getRegVar(UInstr->Defs[0], Model));
+  return reifyNotEqual(getRegVar(SrcDef, M),
+                       getRegVar(UInstr->Defs[0], M), M);
 }
 
-void Unison::penalizeCopies(sat::LinearExpr &Objective) {
+void Unison::penalizeCopies(sat::LinearExpr &Objective, UnisonMBB &UMBB,
+                            sat::CpModelBuilder &M) {
   static constexpr int64_t MemOpWeight = 10;
   static constexpr int64_t RematWeight = 1;
   static constexpr int64_t CopyWeight = 1;
   static constexpr int64_t MaxFreq = 1000000;
 
-  for (auto &UMBB : UFunc.MBBs) {
-    int64_t Freq = std::min<int64_t>(
-        std::max<int64_t>(A.MBFI->getBlockFreq(UMBB->MBB).getFrequency(), 1),
-        MaxFreq);
+  int64_t Freq = std::min<int64_t>(
+      std::max<int64_t>(A.MBFI->getBlockFreq(UMBB.MBB).getFrequency(), 1),
+      MaxFreq);
 
-    for (auto &UInstrPtr : UMBB->Instrs) {
-      UnisonInstr *UInstr = UInstrPtr.get();
+  for (auto &UInstrPtr : UMBB.Instrs) {
+    UnisonInstr *UInstr = &UInstrPtr;
 
-      // Real COPY instructions: penalize non-identity copies.
-      if (UInstr->K == UnisonInstr::RealInstr &&
-          UInstr->RealMI->isCopy() && !UInstr->Uses.empty()) {
-        Objective += Freq * CopyWeight * getIsNotIdentityCopy(UInstr);
-        continue;
-      }
+    // Real COPY instructions: penalize non-identity copies.
+    if (UInstr->K == UnisonInstr::RealInstr &&
+        UInstr->RealMI->isCopy() && !UInstr->Uses.empty()) {
+      Objective += Freq * CopyWeight * getIsNotIdentityCopy(UInstr, M);
+      continue;
+    }
 
-      // CopyOps: penalize based on opcode.
-      if (!UInstr->isCopyOp())
-        continue;
-      auto ActiveIt = IsActiveVar.find(UInstr);
-      assert(ActiveIt != IsActiveVar.end());
-      sat::BoolVar Active = ActiveIt->second;
+    // CopyOps: penalize based on opcode.
+    if (!UInstr->isCopyOp())
+      continue;
+    auto ActiveIt = IsActiveVar.find(UInstr);
+    assert(ActiveIt != IsActiveVar.end());
+    sat::BoolVar Active = ActiveIt->second;
 
-      for (unsigned I = 0; I < UInstr->AltOpcodes.size(); ++I) {
-        unsigned Opcode = UInstr->AltOpcodes[I];
-        sat::BoolVar IsOpcChosen = reifyEquality(getInsVar(UInstr, Model), I);
-        sat::BoolVar ShouldIncludeInCost = reifyAnd(IsOpcChosen, Active);
+    for (unsigned I = 0; I < UInstr->AltOpcodes.size(); ++I) {
+      unsigned Opcode = UInstr->AltOpcodes[I];
+      sat::BoolVar IsOpcChosen = reifyEquality(getInsVar(UInstr, M), I, M);
+      sat::BoolVar ShouldIncludeInCost = reifyAnd(IsOpcChosen, Active, M);
 
-        if (Opcode == COPY_STORE || Opcode == COPY_LOAD ||
-            Opcode == COPY_MEM) {
-          Objective += Freq * MemOpWeight * ShouldIncludeInCost;
-        } else if (Opcode == COPY_REMAT) {
-          Objective += Freq * RematWeight * ShouldIncludeInCost;
-        } else {
-          // COPY_MOVE: only penalize non-identity.
-          sat::BoolVar NotIdentity = getIsNotIdentityCopy(UInstr);
-          ShouldIncludeInCost = reifyAnd(ShouldIncludeInCost, NotIdentity);
-          Objective += Freq * CopyWeight * ShouldIncludeInCost;
-        }
+      if (Opcode == COPY_STORE || Opcode == COPY_LOAD ||
+          Opcode == COPY_MEM) {
+        Objective += Freq * MemOpWeight * ShouldIncludeInCost;
+      } else if (Opcode == COPY_REMAT) {
+        Objective += Freq * RematWeight * ShouldIncludeInCost;
+      } else {
+        // COPY_MOVE: only penalize non-identity.
+        sat::BoolVar NotIdentity = getIsNotIdentityCopy(UInstr, M);
+        ShouldIncludeInCost = reifyAnd(ShouldIncludeInCost, NotIdentity, M);
+        Objective += Freq * CopyWeight * ShouldIncludeInCost;
       }
     }
   }
@@ -1891,7 +1920,8 @@ DenseSet<int> Unison::getPenalizedCSRIndices() const {
   return Result;
 }
 
-void Unison::penalizeCalleeSavedRegisters(sat::LinearExpr &Objective) {
+void Unison::penalizeCalleeSavedRegisters(sat::LinearExpr &Objective,
+                                          sat::CpModelBuilder &M) {
   static constexpr int64_t MaxFreq = 1000000;
 
   // CSR save/restore cost is 2 instructions (sd + ld) per function
@@ -1905,92 +1935,323 @@ void Unison::penalizeCalleeSavedRegisters(sat::LinearExpr &Objective) {
 
   DenseSet<int> PenalizedCSRIndices = getPenalizedCSRIndices();
 
-  // Penalize each unmodified CSR that has at least one vreg assigned.
+  // Collect all GlobalModel boundary vars (deduplicated: one per vreg
+  // is enough since congruence links them).
+  DenseMap<Register, sat::IntVar> SeenVRegs;
+  for (auto &[Key, GVar] : GlobalLiveInVar)
+    SeenVRegs.try_emplace(Key.second, GVar);
+  for (auto &[Key, GVar] : GlobalLiveOutVar)
+    SeenVRegs.try_emplace(Key.second, GVar);
+
+  // Penalize each unmodified CSR that has at least one cross-block vreg
+  // assigned to it.
   for (int Idx : PenalizedCSRIndices) {
     SmallVector<sat::BoolVar, 8> VRegAtIdx;
-    for (auto &[Reg, PhysRegVar] : VRegToPhysRegVar)
-      VRegAtIdx.push_back(reifyEquality(PhysRegVar, Idx));
+    for (auto &[Reg, GVar] : SeenVRegs)
+      VRegAtIdx.push_back(reifyEquality(GVar, Idx, M));
     if (VRegAtIdx.empty())
       continue;
-    sat::BoolVar CSRUsed = Model.NewBoolVar();
-    Model.AddBoolOr(VRegAtIdx).OnlyEnforceIf(CSRUsed);
+    sat::BoolVar CSRUsed = M.NewBoolVar();
+    M.AddBoolOr(VRegAtIdx).OnlyEnforceIf(CSRUsed);
     for (auto &B : VRegAtIdx)
-      Model.AddEquality(B, false).OnlyEnforceIf(~CSRUsed);
+      M.AddEquality(B, false).OnlyEnforceIf(~CSRUsed);
     Objective += EntryFreq * CSRWeight * CSRUsed;
   }
 }
 
-void Unison::addMinimizeMakespanObjective(sat::LinearExpr &Objective) {
+void Unison::penalizeGlobalSpills(sat::LinearExpr &Objective,
+                                  sat::CpModelBuilder &M) {
+  static constexpr int64_t SpillWeight = 100;
   static constexpr int64_t MaxFreq = 1000000;
-  for (auto &UMBB : UFunc.MBBs) {
-    int64_t Freq = std::min<int64_t>(
-        std::max<int64_t>(A.MBFI->getBlockFreq(UMBB->MBB).getFrequency(), 1),
-        MaxFreq);
-    for (auto &UInstrPtr : UMBB->Instrs) {
-      if (UInstrPtr->K == UnisonInstr::LiveOutUse)
-        Objective += Freq * getICVar(UInstrPtr.get(), Model);
-    }
+
+  // Penalize once per unique vreg to avoid double-counting
+  // (congruence forces live-in and live-out to be equal).
+  DenseMap<Register, sat::IntVar> SeenVRegs;
+  for (auto &[Key, GVar] : GlobalLiveInVar)
+    SeenVRegs.try_emplace(Key.second, GVar);
+  for (auto &[Key, GVar] : GlobalLiveOutVar)
+    SeenVRegs.try_emplace(Key.second, GVar);
+
+  int64_t EntryFreq = std::min<int64_t>(
+      std::max<int64_t>(
+          A.MBFI->getBlockFreq(&MF.front()).getFrequency(), 1),
+      MaxFreq);
+
+  for (auto &[Reg, GVar] : SeenVRegs) {
+    // IsSpilled = (GVar >= NumPhysRegs), i.e. assigned to memory domain.
+    sat::BoolVar IsSpilled = M.NewBoolVar();
+    M.AddGreaterOrEqual(GVar, NumPhysRegs).OnlyEnforceIf(IsSpilled);
+    M.AddLessThan(GVar, NumPhysRegs).OnlyEnforceIf(~IsSpilled);
+    Objective += EntryFreq * SpillWeight * IsSpilled;
+  }
+}
+
+void Unison::addMinimizeMakespanObjective(sat::LinearExpr &Objective,
+                                          UnisonMBB &UMBB,
+                                          sat::CpModelBuilder &M) {
+  static constexpr int64_t MaxFreq = 1000000;
+  int64_t Freq = std::min<int64_t>(
+      std::max<int64_t>(A.MBFI->getBlockFreq(UMBB.MBB).getFrequency(), 1),
+      MaxFreq);
+  for (auto &UInstrPtr : UMBB.Instrs) {
+    if (UInstrPtr.K == UnisonInstr::LiveOutUse)
+      Objective += Freq * getICVar(&UInstrPtr, M);
   }
 }
 
 void Unison::addObjectiveFunction() {
-  sat::LinearExpr Objective;
+  // GlobalModel objective: penalize callee-saved register usage + spills.
+  {
+    sat::LinearExpr GlobalObjective;
+    penalizeCalleeSavedRegisters(GlobalObjective, GlobalModel);
+    penalizeGlobalSpills(GlobalObjective, GlobalModel);
+    GlobalModel.Minimize(GlobalObjective);
+  }
 
-  penalizeCopies(Objective);
-  penalizeCalleeSavedRegisters(Objective);
-  addMinimizeMakespanObjective(Objective);
-
-  Model.Minimize(Objective);
+  // Per-MBB LocalModel objectives: copy cost + makespan.
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+    sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+    sat::LinearExpr LocalObjective;
+    penalizeCopies(LocalObjective, *UFunc.MBBs[MBBIdx], LM);
+    addMinimizeMakespanObjective(LocalObjective, *UFunc.MBBs[MBBIdx], LM);
+    LM.Minimize(LocalObjective);
+  }
 }
 
+// ---------------------------------------------------------------------------
+// Pin boundary values into a local proto copy (raw proto manipulation).
+// Variable indices from the original LocalModel are valid in the proto
+// since the proto was copied from LocalModels[MBBIdx].
+// ---------------------------------------------------------------------------
+
+// Helper: add VarIdx == Val as a LinearConstraint in the proto.
+static void addProtoEquality(sat::CpModelProto &Proto,
+                             int VarIdx, int64_t Val) {
+  auto *CT = Proto.add_constraints();
+  auto *Lin = CT->mutable_linear();
+  Lin->add_vars(VarIdx);
+  Lin->add_coeffs(1);
+  Lin->add_domain(Val);
+  Lin->add_domain(Val);
+}
+
+// Helper: add (ChoiceIdx == K) => (RegIdx == Val).
+// Creates a fresh Bool variable B_k with full reification:
+//   B_k <=> (ChoiceIdx == K), then B_k => (RegIdx == Val).
+static void addProtoConditionalEquality(sat::CpModelProto &Proto,
+                                        int ChoiceIdx, int64_t K,
+                                        int64_t ChoiceSize,
+                                        int RegIdx, int64_t Val) {
+  // Create B_k: domain [0,1].
+  int Bk = Proto.variables_size();
+  auto *BVar = Proto.add_variables();
+  BVar->add_domain(0);
+  BVar->add_domain(1);
+
+  // B_k => ChoiceIdx == K.
+  auto *CT1 = Proto.add_constraints();
+  CT1->add_enforcement_literal(Bk);
+  auto *Lin1 = CT1->mutable_linear();
+  Lin1->add_vars(ChoiceIdx);
+  Lin1->add_coeffs(1);
+  Lin1->add_domain(K);
+  Lin1->add_domain(K);
+
+  // ~B_k => ChoiceIdx != K  (domain of ChoiceIdx excluding K).
+  auto *CT2 = Proto.add_constraints();
+  CT2->add_enforcement_literal(-(Bk + 1)); // CP-SAT negated literal
+  auto *Lin2 = CT2->mutable_linear();
+  Lin2->add_vars(ChoiceIdx);
+  Lin2->add_coeffs(1);
+  if (K == 0) {
+    Lin2->add_domain(1);
+    Lin2->add_domain(ChoiceSize - 1);
+  } else if (K == ChoiceSize - 1) {
+    Lin2->add_domain(0);
+    Lin2->add_domain(K - 1);
+  } else {
+    // [0, K-1] ∪ [K+1, ChoiceSize-1]
+    Lin2->add_domain(0);
+    Lin2->add_domain(K - 1);
+    Lin2->add_domain(K + 1);
+    Lin2->add_domain(ChoiceSize - 1);
+  }
+
+  // B_k => RegIdx == Val.
+  auto *CT3 = Proto.add_constraints();
+  CT3->add_enforcement_literal(Bk);
+  auto *Lin3 = CT3->mutable_linear();
+  Lin3->add_vars(RegIdx);
+  Lin3->add_coeffs(1);
+  Lin3->add_domain(Val);
+  Lin3->add_domain(Val);
+}
+
+void Unison::pinBoundaryValuesToProto(sat::CpModelProto &Proto,
+                                      unsigned MBBIdx) {
+  UnisonMBB &UMBB = *UFunc.MBBs[MBBIdx];
+  sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+
+  // Pin LiveInDef defs.
+  for (UnisonDef *D : UMBB.getLiveIn()->Defs) {
+    Register Reg = D->Reg;
+    if (!Reg.isValid() || !Reg.isVirtual())
+      continue;
+    auto GIt = GlobalLiveInVar.find({&UMBB, Reg});
+    if (GIt == GlobalLiveInVar.end())
+      continue;
+    int64_t Val = sat::SolutionIntegerValue(GlobalResponse, GIt->second);
+    addProtoEquality(Proto, getRegVar(D, LM).index(), Val);
+  }
+
+  // Pin LiveOutUse: (ChoiceVar == k) => RegVar[D_k] == Val.
+  UnisonInstr *LiveOut = UMBB.getLiveOut();
+  for (UnisonUse *U : LiveOut->Uses) {
+    Register Reg = U->Reg;
+    if (!Reg.isValid() || !Reg.isVirtual())
+      continue;
+    auto GIt = GlobalLiveOutVar.find({&UMBB, Reg});
+    if (GIt == GlobalLiveOutVar.end())
+      continue;
+    int64_t Val = sat::SolutionIntegerValue(GlobalResponse, GIt->second);
+    if (U->PotentialDefs.size() == 1) {
+      addProtoEquality(Proto, getRegVar(U->PotentialDefs[0], LM).index(), Val);
+    } else {
+      int ChoiceIdx = getChoiceVar(U, LM).index();
+      int64_t ChoiceSize = U->PotentialDefs.size();
+      for (unsigned K = 0; K < U->PotentialDefs.size(); ++K)
+        addProtoConditionalEquality(Proto, ChoiceIdx, K, ChoiceSize,
+                                    getRegVar(U->PotentialDefs[K], LM).index(),
+                                    Val);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Nogood: forbid the current global boundary assignment for MBBIdx.
+// "At least one boundary variable for this MBB must take a different value."
+// ---------------------------------------------------------------------------
+
+void Unison::addNogoodForMBB(unsigned MBBIdx) {
+  UnisonMBB &UMBB = *UFunc.MBBs[MBBIdx];
+
+  SmallVector<sat::BoolVar, 8> NegLits;
+  for (auto &[Key, GVar] : GlobalLiveInVar) {
+    if (Key.first != &UMBB)
+      continue;
+    int64_t Val = sat::SolutionIntegerValue(GlobalResponse, GVar);
+    NegLits.push_back(~reifyEquality(GVar, Val, GlobalModel));
+  }
+  for (auto &[Key, GVar] : GlobalLiveOutVar) {
+    if (Key.first != &UMBB)
+      continue;
+    int64_t Val = sat::SolutionIntegerValue(GlobalResponse, GVar);
+    NegLits.push_back(~reifyEquality(GVar, Val, GlobalModel));
+  }
+
+  if (!NegLits.empty())
+    GlobalModel.AddBoolOr(NegLits);
+}
+
+// ---------------------------------------------------------------------------
+// Benders decomposition solve loop.
+// ---------------------------------------------------------------------------
+
 void Unison::solve() {
-  // Validate model before solving.
-  {
-    std::string err = operations_research::sat::ValidateCpModel(Model.Proto());
-    if (!err.empty()) {
-      LLVM_DEBUG(dbgs() << "  Model validation error: " << err << "\n");
-      report_fatal_error("Unison: invalid CP-SAT model for " + MF.getName() +
-                         ": " + err);
+  // Save template protos for each LocalModel before any pin constraints.
+  // Each iteration, we copy the template and add pins to the copy.
+  SmallVector<sat::CpModelProto, 0> LocalTemplates;
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx)
+    LocalTemplates.push_back(LocalModels[MBBIdx].Proto());
+
+  LocalResponses.resize(UFunc.MBBs.size());
+
+  for (int Iter = 0; Iter < UnisonMaxBendersIter; ++Iter) {
+    // --- Phase 1: Solve GlobalModel ---
+    {
+      std::string Err = sat::ValidateCpModel(GlobalModel.Proto());
+      if (!Err.empty())
+        report_fatal_error("Unison: invalid GlobalModel for " + MF.getName() +
+                           ": " + Err);
+
+      sat::SatParameters Params;
+      Params.set_max_time_in_seconds(
+          static_cast<double>(UnisonMaxTimeLimit));
+      Params.set_num_workers(UnisonNumWorkers);
+
+      GlobalResponse = sat::SolveWithParameters(GlobalModel.Build(), Params);
+
+      LLVM_DEBUG(dbgs() << "  [iter " << Iter << "] GlobalModel status: "
+                        << GlobalResponse.status()
+                        << " (wall time " << GlobalResponse.wall_time()
+                        << "s)\n");
+
+      if (GlobalResponse.status() != sat::CpSolverStatus::OPTIMAL &&
+          GlobalResponse.status() != sat::CpSolverStatus::FEASIBLE)
+        report_fatal_error("Unison: GlobalModel infeasible for " +
+                           MF.getName() + " after " + Twine(Iter) +
+                           " Benders iterations");
+
+      LLVM_DEBUG({
+        for (auto &[Key, GVar] : GlobalLiveInVar)
+          dbgs() << "    LiveIn MBB#" << Key.first->MBB->getNumber()
+                 << " " << printReg(Key.second, A.TRI) << " = "
+                 << sat::SolutionIntegerValue(GlobalResponse, GVar) << "\n";
+        for (auto &[Key, GVar] : GlobalLiveOutVar)
+          dbgs() << "    LiveOut MBB#" << Key.first->MBB->getNumber()
+                 << " " << printReg(Key.second, A.TRI) << " = "
+                 << sat::SolutionIntegerValue(GlobalResponse, GVar) << "\n";
+      });
+    }
+
+    // --- Phase 2: Pin boundary values and solve each LocalModel ---
+    // For iteration over MBB's order them by block frequency (so we try to solve hottest blocks first.
+    bool AllFeasible = true;
+    for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+      // Copy template and add pin constraints.
+      sat::CpModelProto LocalProto = LocalTemplates[MBBIdx];
+      pinBoundaryValuesToProto(LocalProto, MBBIdx);
+
+      sat::SatParameters Params;
+      unsigned NInstrs = UFunc.MBBs[MBBIdx]->Instrs.size();
+      int TimeLimit = std::clamp(
+          static_cast<int>(NInstrs) * UnisonTimeLimitPerInstr,
+          static_cast<int>(UnisonMinTimeLimit),
+          static_cast<int>(UnisonMaxTimeLimit));
+      Params.set_max_time_in_seconds(static_cast<double>(TimeLimit));
+      Params.set_num_workers(UnisonNumWorkers);
+
+      LocalResponses[MBBIdx] =
+          sat::SolveWithParameters(LocalProto, Params);
+
+      LLVM_DEBUG(dbgs() << "  [iter " << Iter << "] LocalModel MBB#"
+                        << UFunc.MBBs[MBBIdx]->MBB->getNumber()
+                        << " status: " << LocalResponses[MBBIdx].status()
+                        << " (wall time "
+                        << LocalResponses[MBBIdx].wall_time() << "s, "
+                        << NInstrs << " instrs)\n");
+
+      if (LocalResponses[MBBIdx].status() != sat::CpSolverStatus::OPTIMAL &&
+          LocalResponses[MBBIdx].status() != sat::CpSolverStatus::FEASIBLE) {
+        LLVM_DEBUG(dbgs() << "  LocalModel MBB#"
+                          << UFunc.MBBs[MBBIdx]->MBB->getNumber()
+                          << " infeasible — adding nogood to GlobalModel\n");
+        addNogoodForMBB(MBBIdx);
+        AllFeasible = false;
+        break; // re-solve global
+      }
+    }
+
+    if (AllFeasible) {
+      LLVM_DEBUG(dbgs() << "  Benders converged after " << Iter + 1
+                        << " iteration(s)\n");
+      return;
     }
   }
 
-  sat::SatParameters Params;
-  // Scale timeout by function size: more instructions → more time.
-  unsigned TotalInstrs = 0;
-  for (auto &UMBB : UFunc.MBBs)
-    TotalInstrs += UMBB->Instrs.size();
-  int TimeLimit = std::clamp(
-      static_cast<int>(TotalInstrs) * UnisonTimeLimitPerInstr,
-      static_cast<int>(UnisonMinTimeLimit),
-      static_cast<int>(UnisonMaxTimeLimit));
-  LLVM_DEBUG(dbgs() << "  Solver time limit: " << TimeLimit
-                    << "s (" << TotalInstrs << " instrs)\n");
-  Params.set_max_time_in_seconds(static_cast<double>(TimeLimit));
-  Params.set_num_workers(UnisonNumWorkers);
-
-  sat::CpSolverResponse Response =
-      sat::SolveWithParameters(Model.Build(), Params);
-
-  LLVM_DEBUG(dbgs() << "  CP-SAT status: " << Response.status()
-                    << " (wall time " << Response.wall_time() << "s)\n");
-
-  if (Response.status() != sat::CpSolverStatus::OPTIMAL &&
-      Response.status() != sat::CpSolverStatus::FEASIBLE) {
-    LLVM_DEBUG(dbgs() << "  Model has " << Model.Proto().variables_size()
-                      << " variables, "
-                      << Model.Proto().constraints_size()
-                      << " constraints\n");
-    const char *StatusStr = "unknown";
-    if (Response.status() == sat::CpSolverStatus::MODEL_INVALID)
-      StatusStr = "model invalid";
-    else if (Response.status() == sat::CpSolverStatus::INFEASIBLE)
-      StatusStr = "infeasible";
-    report_fatal_error(Twine("Unison CP-SAT: ") + StatusStr + " for " +
-                       MF.getName());
-  }
-
-  // Store response for use by generateCodeFromSolution.
-  SolverResponse = Response;
+  report_fatal_error("Unison: Benders loop did not converge after " +
+                     Twine(UnisonMaxBendersIter) + " iterations for " +
+                     MF.getName());
 }
 
 static StringRef copyOpcodeToName(unsigned Opcode) {
@@ -2021,15 +2282,16 @@ void Unison::dumpSolution(StringRef Filename) {
     return;
   }
 
-  const auto &Response = SolverResponse;
   OS << "# Solution for " << MF.getName() << "\n";
-  for (auto &UMBB : UFunc.MBBs) {
-    OS << "# MBB#" << UMBB->MBB->getNumber() << "\n";
-    for (auto &UIP : UMBB->Instrs) {
-      UnisonInstr *UI = UIP.get();
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+    const auto &Response = LocalResponses[MBBIdx];
+    sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+    UnisonMBB &UMBB = *UFunc.MBBs[MBBIdx];
 
-      // Skip inactive CopyOps — their variable values are don't-cares
-      // and can conflict with constraints if fixed during pre-assignment.
+    OS << "# MBB#" << UMBB.MBB->getNumber() << "\n";
+    for (auto &UIP : UMBB.Instrs) {
+      UnisonInstr *UI = &UIP;
+
       if (UI->isCopyOp()) {
         auto ActiveIt = IsActiveVar.find(UI);
         bool IsActive = ActiveIt != IsActiveVar.end() &&
@@ -2038,22 +2300,23 @@ void Unison::dumpSolution(StringRef Filename) {
            << IsActive << "\n";
         if (!IsActive)
           continue;
-        int64_t InsVal = sat::SolutionIntegerValue(Response, getInsVar(UI, Model));
+        int64_t InsVal = sat::SolutionIntegerValue(Response,
+                             getInsVar(UI, LM));
         OS << NamingScheme::nameVariable(UI->Name, "ins") << " = "
            << copyOpcodeToName(UI->AltOpcodes[static_cast<unsigned>(InsVal)])
            << "\n";
       }
 
       OS << NamingScheme::nameVariable(UI->Name, "ic") << " = "
-         << sat::SolutionIntegerValue(Response, getICVar(UI, Model)) << "\n";
+         << sat::SolutionIntegerValue(Response, getICVar(UI, LM)) << "\n";
       for (unsigned I = 0; I < UI->Defs.size(); I++)
         OS << NamingScheme::nameVariable(UI->Name,
                "def[" + Twine(I) + "].reg") << " = "
-           << sat::SolutionIntegerValue(Response, getRegVar(UI->Defs[I], Model))
+           << sat::SolutionIntegerValue(Response, getRegVar(UI->Defs[I], LM))
            << "\n";
       for (unsigned I = 0; I < UI->Uses.size(); I++) {
         int64_t Ch = sat::SolutionIntegerValue(Response,
-                         getChoiceVar(UI->Uses[I], Model));
+                         getChoiceVar(UI->Uses[I], LM));
         StringRef ChoiceName = UI->Uses[I]
             ->PotentialDefs[static_cast<unsigned>(Ch)]->Parent->Name;
         OS << NamingScheme::nameVariable(UI->Name,
@@ -2099,42 +2362,13 @@ int64_t Unison::getChoiceVarValueFromName(StringRef VarName, StringRef ValStr) {
 }
 
 void Unison::loadPreAssignments(StringRef Filename) {
-  auto BufOrErr = MemoryBuffer::getFile(Filename);
-  if (!BufOrErr) {
-    report_fatal_error(Twine("Unison: cannot open pre-assignment file: ") +
-                       Filename);
-  }
-  SmallVector<StringRef> Lines;
-  BufOrErr.get()->getBuffer().split(Lines, '\n');
-  unsigned LineNo = 0;
-  for (StringRef Line : Lines) {
-    LineNo++;
-    Line = Line.trim();
-    if (Line.empty() || Line.starts_with("#"))
-      continue;
-    auto [Name, ValStr] = Line.split('=');
-    Name = Name.trim();
-    ValStr = ValStr.trim();
-
-    // Try numeric value first, then symbolic resolution.
-    int64_t Value;
-    if (ValStr.getAsInteger(10, Value)) {
-      if (Name.ends_with(".ins"))
-        Value = getInsVarValueFromName(Name, ValStr);
-      else if (Name.ends_with("].choice"))
-        Value = getChoiceVarValueFromName(Name, ValStr);
-      else
-        report_fatal_error(Twine("Non-numeric value '") + ValStr +
-                           "' for variable '" + Name + "' at " +
-                           Filename + ":" + Twine(LineNo));
-    }
-
-    auto Var = NS.getVariableByName(Name);
-    if (!Var)
-      report_fatal_error(Twine("Unknown variable '") + Name + "' at " +
-                         Filename + ":" + Twine(LineNo));
-    Model.AddEquality(*Var, Value);
-  }
+  // TODO: Pre-assignments need rework for split models — variables now
+  // live in per-MBB LocalModels rather than one monolithic model.
+  // The NamingScheme maps variable names to solver IntVars, but those
+  // IntVars belong to specific LocalModels. Need to route each
+  // pre-assignment to the correct model.
+  report_fatal_error("Unison: pre-assignments not yet supported with "
+                     "split models");
 }
 
 void Unison::generateCodeFromSolution() {
@@ -2145,27 +2379,30 @@ void Unison::generateCodeFromSolution() {
 }
 
 void Unison::removeInactiveInstructions() {
-  const auto &Response = SolverResponse;
-  for (auto &UMBB : UFunc.MBBs) {
-    UMBB->Instrs.remove_if(
-        [&](const std::unique_ptr<UnisonInstr> &UIP) {
-          if (!UIP->isCopyOp())
-            return false;
-          auto AIt = IsActiveVar.find(UIP.get());
-          assert(AIt != IsActiveVar.end());
-          return !sat::SolutionBooleanValue(Response, AIt->second);
-        });
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+    const auto &Response = LocalResponses[MBBIdx];
+    auto &Instrs = UFunc.MBBs[MBBIdx]->Instrs;
+    for (auto It = Instrs.begin(); It != Instrs.end(); ) {
+      UnisonInstr &UI = *It;
+      if (!UI.isCopyOp()) { ++It; continue; }
+      auto AIt = IsActiveVar.find(&UI);
+      assert(AIt != IsActiveVar.end());
+      if (!sat::SolutionBooleanValue(Response, AIt->second))
+        It = Instrs.erase(It);
+      else
+        ++It;
+    }
   }
 }
 
 void Unison::sortByIssueCycle() {
-  const auto &Response = SolverResponse;
-  for (auto &UMBB : UFunc.MBBs) {
-    UMBB->Instrs.sort(
-        [&](const std::unique_ptr<UnisonInstr> &A,
-            const std::unique_ptr<UnisonInstr> &B) {
-          int64_t ICA = sat::SolutionIntegerValue(Response, getICVar(A.get(), Model));
-          int64_t ICB = sat::SolutionIntegerValue(Response, getICVar(B.get(), Model));
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+    const auto &Response = LocalResponses[MBBIdx];
+    sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+    UFunc.MBBs[MBBIdx]->Instrs.sort(
+        [&](UnisonInstr &A, UnisonInstr &B) {
+          int64_t ICA = sat::SolutionIntegerValue(Response, getICVar(&A, LM));
+          int64_t ICB = sat::SolutionIntegerValue(Response, getICVar(&B, LM));
           return ICA < ICB;
         });
   }
@@ -2173,19 +2410,21 @@ void Unison::sortByIssueCycle() {
 
 MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
                                          MachineBasicBlock *MBB,
-                                         MachineBasicBlock::iterator InsertPt) {
-  const auto &Response = SolverResponse;
-  int64_t InsVal = sat::SolutionIntegerValue(Response, getInsVar(UInstr, Model));
+                                         MachineBasicBlock::iterator InsertPt,
+                                         unsigned MBBIdx) {
+  const auto &Response = LocalResponses[MBBIdx];
+  sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+
+  int64_t InsVal = sat::SolutionIntegerValue(Response, getInsVar(UInstr, LM));
   unsigned Opcode = UInstr->AltOpcodes[static_cast<unsigned>(InsVal)];
   int64_t DstIdx = sat::SolutionIntegerValue(Response,
-                                              getRegVar(UInstr->Defs[0], Model));
+                                              getRegVar(UInstr->Defs[0], LM));
   UnisonUse *UseOp = UInstr->Uses[0];
-  int64_t Choice = sat::SolutionIntegerValue(Response, getChoiceVar(UseOp, Model));
+  int64_t Choice = sat::SolutionIntegerValue(Response, getChoiceVar(UseOp, LM));
   UnisonDef *SrcDef = UseOp->PotentialDefs[static_cast<unsigned>(Choice)];
   int64_t SrcIdx = sat::SolutionIntegerValue(Response,
-                       getRegVar(SrcDef, Model));
+                       getRegVar(SrcDef, LM));
 
-  // Get or create a stack slot for a memory index from the solver.
   auto getOrCreateStackSlot = [&](int64_t MemIdx,
                                   const TargetRegisterClass *RC) -> int {
     int Key = static_cast<int>(MemIdx);
@@ -2203,7 +2442,6 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
     MCRegister SrcPhys = IdxToMCReg[static_cast<int>(SrcIdx)];
     const TargetRegisterClass *RC = A.TRI->getMinimalPhysRegClass(SrcPhys);
     int FI = getOrCreateStackSlot(DstIdx, RC);
-
     A.TII->storeRegToStackSlot(*MBB, InsertPt, SrcPhys, true,
                                FI, RC, SrcPhys);
     ++NumSpillStores;
@@ -2214,7 +2452,6 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
     MCRegister DstPhys = IdxToMCReg[static_cast<int>(DstIdx)];
     const TargetRegisterClass *RC = A.TRI->getMinimalPhysRegClass(DstPhys);
     int FI = getOrCreateStackSlot(SrcIdx, RC);
-
     A.TII->loadRegFromStackSlot(*MBB, InsertPt, DstPhys,
                                 FI, RC, DstPhys);
     ++NumSpillLoads;
@@ -2223,10 +2460,7 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
   } else if (Opcode == COPY_MEM) {
     assert(SrcIdx >= NumPhysRegs && DstIdx >= NumPhysRegs);
     if (SrcIdx == DstIdx)
-      return nullptr; // Identity: same memory slot, no instruction.
-    // Memory-to-memory copy: load to temp register, then store.
-    // Find a register class for the scratch register. Use the first
-    // RC that overlaps with the physical register domain.
+      return nullptr;
     const TargetRegisterClass *RC = nullptr;
     for (auto &[RCIt, Dom] : RCDomain) {
       if (!Dom.IsEmpty()) {
@@ -2256,15 +2490,11 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
     assert(DstIdx < NumPhysRegs);
     assert(RematMIs.lookup(UInstr) && "COPY_REMAT without RematMI");
     MCRegister DstPhys = IdxToMCReg[static_cast<int>(DstIdx)];
-
     MachineInstr *Clone = MF.CloneMachineInstr(RematMIs.lookup(UInstr));
-    // Rewrite all operands to physregs.
     for (MachineOperand &MO : Clone->operands()) {
       if (!MO.isReg()) continue;
       if (MO.isDef())
         MO.setReg(DstPhys);
-      // Use operands should already be physregs (remat instrs use
-      // constants or always-available regs like $x0).
     }
     MBB->insert(InsertPt, Clone);
     return Clone;
@@ -2279,7 +2509,6 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
                       << (SrcPhys == DstPhys ? " (identity, skip)\n" : "\n"));
     if (SrcPhys == DstPhys)
       return nullptr;
-
     return BuildMI(*MBB, InsertPt, DebugLoc(),
                    A.TII->get(TargetOpcode::COPY), DstPhys)
                .addReg(SrcPhys);
@@ -2287,46 +2516,43 @@ MachineInstr *Unison::materializeCopyOp(UnisonInstr *UInstr,
 }
 
 void Unison::generateInstructions() {
-  const auto &Response = SolverResponse;
+  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
+    const auto &Response = LocalResponses[MBBIdx];
+    sat::CpModelBuilder &LM = LocalModels[MBBIdx];
+    UnisonMBB &UMBB = *UFunc.MBBs[MBBIdx];
+    MachineBasicBlock *MBB = UMBB.MBB;
 
-  // Rewrite a real instruction's operands to physregs using the
-  // solver solution. Defs get the physreg from their Reg.Var.
-  // Uses get the physreg from their chosen def's Reg.Var.
-  auto rewriteRealInstr = [&](UnisonInstr *UI) {
-    MachineInstr *MI = UI->RealMI;
-    assert(MI);
+    // Rewrite a real instruction's operands to physregs.
+    auto rewriteRealInstr = [&](UnisonInstr *UI) {
+      MachineInstr *MI = UI->RealMI;
+      assert(MI);
 
-    // Rewrite defs: each def's RegVar gives the physreg.
-    SmallVector<CanonicalOperand, 8> CanonDefs;
-    getMIDefsInCanonicalOrder(*MI, CanonDefs);
-    for (unsigned I = 0; I < UI->Defs.size() && I < CanonDefs.size(); ++I) {
-      if (!CanonDefs[I].MO || CanonDefs[I].Reg.isPhysical())
-        continue;
-      int64_t Idx = sat::SolutionIntegerValue(Response, getRegVar(UI->Defs[I], Model));
-      if (Idx < NumPhysRegs)
-        CanonDefs[I].MO->setReg(IdxToMCReg[static_cast<int>(Idx)]);
-    }
+      SmallVector<CanonicalOperand, 8> CanonDefs;
+      getMIDefsInCanonicalOrder(*MI, CanonDefs);
+      for (unsigned I = 0; I < UI->Defs.size() && I < CanonDefs.size(); ++I) {
+        if (!CanonDefs[I].MO || CanonDefs[I].Reg.isPhysical())
+          continue;
+        int64_t Idx = sat::SolutionIntegerValue(Response,
+                          getRegVar(UI->Defs[I], LM));
+        if (Idx < NumPhysRegs)
+          CanonDefs[I].MO->setReg(IdxToMCReg[static_cast<int>(Idx)]);
+      }
 
-    // Rewrite uses: each use's chosen def's RegVar gives the physreg.
-    // Both virtual AND physical register uses are rewritten — a CopyOp
-    // may redirect a physical register use to a different register.
-    SmallVector<CanonicalOperand, 8> CanonUses;
-    getMIUsesInCanonicalOrder(*MI, CanonUses);
-    for (unsigned I = 0; I < UI->Uses.size() && I < CanonUses.size(); ++I) {
-      if (!CanonUses[I].MO)
-        continue;
-      UnisonUse *UseOp = UI->Uses[I];
-      int64_t Choice = sat::SolutionIntegerValue(Response, getChoiceVar(UseOp, Model));
-      UnisonDef *ChosenDef = UseOp->PotentialDefs[static_cast<unsigned>(Choice)];
-      int64_t Idx = sat::SolutionIntegerValue(Response,
-                        getRegVar(ChosenDef, Model));
-      if (Idx < NumPhysRegs)
-        CanonUses[I].MO->setReg(IdxToMCReg[static_cast<int>(Idx)]);
-    }
-  };
-
-  for (auto &UMBB : UFunc.MBBs) {
-    MachineBasicBlock *MBB = UMBB->MBB;
+      SmallVector<CanonicalOperand, 8> CanonUses;
+      getMIUsesInCanonicalOrder(*MI, CanonUses);
+      for (unsigned I = 0; I < UI->Uses.size() && I < CanonUses.size(); ++I) {
+        if (!CanonUses[I].MO)
+          continue;
+        UnisonUse *UseOp = UI->Uses[I];
+        int64_t Choice = sat::SolutionIntegerValue(Response,
+                             getChoiceVar(UseOp, LM));
+        UnisonDef *ChosenDef = UseOp->PotentialDefs[static_cast<unsigned>(Choice)];
+        int64_t Idx = sat::SolutionIntegerValue(Response,
+                          getRegVar(ChosenDef, LM));
+        if (Idx < NumPhysRegs)
+          CanonUses[I].MO->setReg(IdxToMCReg[static_cast<int>(Idx)]);
+      }
+    };
 
     // Remove all instructions from the MBB.
     SmallVector<MachineInstr *, 32> ToRemove;
@@ -2337,12 +2563,12 @@ void Unison::generateInstructions() {
 
     // Update live-in list with physregs.
     MBB->clearLiveIns();
-    for (auto &UIP : UMBB->Instrs) {
-      if (UIP->K != UnisonInstr::LiveInDef)
+    for (auto &UIP : UMBB.Instrs) {
+      if (UIP.K != UnisonInstr::LiveInDef)
         continue;
-      for (unsigned I = 0; I < UIP->Defs.size(); ++I) {
+      for (unsigned I = 0; I < UIP.Defs.size(); ++I) {
         int64_t Idx = sat::SolutionIntegerValue(Response,
-                          getRegVar(UIP->Defs[I], Model));
+                          getRegVar(UIP.Defs[I], LM));
         if (Idx < NumPhysRegs)
           MBB->addLiveIn(IdxToMCReg[static_cast<int>(Idx)]);
       }
@@ -2350,8 +2576,8 @@ void Unison::generateInstructions() {
     MBB->sortUniqueLiveIns();
 
     // Emit all instructions in IC order.
-    for (auto &UIP : UMBB->Instrs) {
-      UnisonInstr *UI = UIP.get();
+    for (auto &UIP : UMBB.Instrs) {
+      UnisonInstr *UI = &UIP;
 
       if (UI->K == UnisonInstr::LiveInDef ||
           UI->K == UnisonInstr::LiveOutUse)
@@ -2362,7 +2588,7 @@ void Unison::generateInstructions() {
         rewriteRealInstr(UI);
         MBB->push_back(UI->RealMI);
       } else if (UI->isCopyOp()) {
-        materializeCopyOp(UI, MBB, MBB->end());
+        materializeCopyOp(UI, MBB, MBB->end(), MBBIdx);
       }
     }
   }
@@ -2372,16 +2598,14 @@ bool Unison::run() {
   LLVM_DEBUG(dbgs() << "Unison CP-SAT Register Allocating for "
                     << MF.getName() << "\n");
 
-  buildURegisterDomains();
-  buildUnisonInstructionsAndAnalyzeDefs();  // IR only, no solver vars
-  copyExtend();                              // IR only, no solver vars
+  createUnisonProgramRepresentation();
 
   LLVM_DEBUG({
     for (auto &UMBB : UFunc.MBBs) {
       dbgs() << "  MBB#" << UMBB->MBB->getNumber() << " locality:\n";
       for (auto &UIP : UMBB->Instrs)
-        dbgs() << "    " << UIP->Name << ": "
-               << (isLocal(UIP.get(), *UMBB->MBB) ? "local" : "GLOBAL")
+        dbgs() << "    " << UIP.Name << ": "
+               << (isLocal(&UIP, *UMBB->MBB) ? "local" : "GLOBAL")
                << "\n";
     }
   });
@@ -2389,28 +2613,7 @@ bool Unison::run() {
   // Initialize per-MBB local models.
   LocalModels.resize(UFunc.MBBs.size());
 
-  // Shared vreg variables in monolithic model (legacy).
-  LLVM_DEBUG(dbgs() << "  VRegDefClass has " << UFunc.VRegDefClass.size()
-                    << " vregs\n");
-  assignPhysRegVarsFromEqClasses(Model);
-
-  // Create variables in GlobalModel and per-MBB LocalModels.
-  // Non-local instructions get variables in both their LocalModel and GlobalModel.
-  // Local instructions get variables only in their LocalModel.
-  for (unsigned MBBIdx = 0; MBBIdx < UFunc.MBBs.size(); ++MBBIdx) {
-    UnisonMBB &UMBB = *UFunc.MBBs[MBBIdx];
-    sat::CpModelBuilder &LM = LocalModels[MBBIdx];
-    for (auto &UIP : UMBB.Instrs) {
-      UnisonInstr *UI = UIP.get();
-      createVariablesForInstr(UI, UMBB, LM);
-      if (!isLocal(UI, *UMBB.MBB))
-        createVariablesForInstr(UI, UMBB, GlobalModel);
-    }
-  }
-
-  // Also create variables in the monolithic model (legacy path).
-  createVariables(Model);
-
+  createVariables();
   addConstraints();
   addObjectiveFunction();
   if (!UnisonPreAssign.empty())
