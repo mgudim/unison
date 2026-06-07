@@ -493,9 +493,6 @@ private:
   // PotentialDefs).
   void wireDefUse(UnisonDef *D, UnisonUse *U);
 
-  // Add a new def choice to an existing use. Appends to PotentialDefs
-  // and updates ChoiceVar domain to cover all choices.
-  void addDefChoice(UnisonUse *U, UnisonDef *D);
 
   // Full reification: returns a BoolVar B such that B <=> (Var == Value).
   sat::BoolVar reifyEquality(sat::IntVar Var, int64_t Value,
@@ -507,11 +504,20 @@ private:
   sat::BoolVar reifyAnd(sat::BoolVar X, sat::BoolVar Y,
                         sat::CpModelBuilder &M);
 
-  // A canonical operand entry: the register and optionally a pointer to
-  // the MachineOperand (null for regmask clobbers).
+  // A canonical operand: MachineOperand* for real defs/uses,
+  // bare Register (MO == nullptr) for regmask clobbers.
   struct CanonicalOperand {
+    MachineOperand *MO = nullptr;
     Register Reg;
-    MachineOperand *MO = nullptr; // null for regmask clobbers
+
+    static CanonicalOperand fromMO(MachineOperand *MO) {
+      return {MO, MO->getReg()};
+    }
+    static CanonicalOperand fromRegmask(Register Reg) {
+      return {nullptr, Reg};
+    }
+    bool isRegmask() const { return MO == nullptr; }
+    Register getReg() const { return Reg; }
   };
 
   // Canonical ordering of register operands for a MachineInstr.
@@ -682,12 +688,6 @@ void Unison::wireDefUse(UnisonDef *D, UnisonUse *U) {
   DefIdxInUseMap[{D, U}] = Idx;
 }
 
-void Unison::addDefChoice(UnisonUse *U, UnisonDef *D) {
-  unsigned Idx = U->PotentialDefs.size();
-  U->PotentialDefs.push_back(D);
-  DefIdxInUseMap[{D, U}] = Idx;
-  D->PotentialUses.push_back(U);
-}
 
 void Unison::getMIDefsInCanonicalOrder(MachineInstr &MI,
                               SmallVectorImpl<CanonicalOperand> &Defs) const {
@@ -703,7 +703,7 @@ void Unison::getMIDefsInCanonicalOrder(MachineInstr &MI,
         continue;
       ExplicitPhysDefs.insert(MCRegister(Reg));
     }
-    Defs.push_back({Reg, &MO});
+    Defs.push_back(CanonicalOperand::fromMO(&MO));
   }
 
   // Regmask clobbers: iterate by dense index order for deterministic
@@ -717,7 +717,7 @@ void Unison::getMIDefsInCanonicalOrder(MachineInstr &MI,
         continue;
       if (ExplicitPhysDefs.count(PhysReg))
         continue;
-      Defs.push_back({Register(PhysReg), nullptr});
+      Defs.push_back(CanonicalOperand::fromRegmask(Register(PhysReg)));
     }
   }
 }
@@ -732,7 +732,7 @@ void Unison::getMIUsesInCanonicalOrder(MachineInstr &MI,
     // Skip non-allocatable physical registers (e.g., $x0 zero register).
     if (Reg.isPhysical() && !MCRegToIdx.count(MCRegister(Reg)))
       continue;
-    Uses.push_back({Reg, &MO});
+    Uses.push_back(CanonicalOperand::fromMO(&MO));
   }
 }
 
@@ -764,7 +764,7 @@ void Unison::collectDefsForUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &M
   SmallVector<CanonicalOperand, 8> CanonDefs;
   getMIDefsInCanonicalOrder(*UInstr->RealMI, CanonDefs);
   for (const CanonicalOperand &CO : CanonDefs)
-    Defs.push_back(CO.Reg);
+    Defs.push_back(CO.getReg());
 }
 
 void Unison::collectUsesForUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &MBB,
@@ -800,7 +800,7 @@ void Unison::collectUsesForUnisonInstr(UnisonInstr *UInstr, MachineBasicBlock &M
   SmallVector<CanonicalOperand, 8> CanonUses;
   getMIUsesInCanonicalOrder(*UInstr->RealMI, CanonUses);
   for (const CanonicalOperand &CO : CanonUses)
-    Uses.push_back(CO.Reg);
+    Uses.push_back(CO.getReg());
 }
 
 void Unison::populateDefsAndUses(UnisonInstr *UInstr, MachineBasicBlock &MBB,
@@ -1293,10 +1293,10 @@ void Unison::copyExtend() {
           wireDefUse(StoreMoveDef, LoadMove->Uses[0]);
           UnisonDef *LoadMoveDef = LoadMove->Defs[0];
 
-          addDefChoice(RealUse, LoadMoveDef);
+          wireDefUse(LoadMoveDef, RealUse);
 
           if (RealUse->Parent->K == UnisonInstr::LiveOutUse)
-            addDefChoice(RealUse, StoreMoveDef);
+            wireDefUse(StoreMoveDef, RealUse);
 
           // Name after wiring so nameInstruction can walk def-use chains.
           NS.nameInstruction(LoadMove, {}, 0);
@@ -2550,7 +2550,7 @@ void Unison::generateInstructions() {
       SmallVector<CanonicalOperand, 8> CanonDefs;
       getMIDefsInCanonicalOrder(*MI, CanonDefs);
       for (unsigned I = 0; I < UI->Defs.size() && I < CanonDefs.size(); ++I) {
-        if (!CanonDefs[I].MO || CanonDefs[I].Reg.isPhysical())
+        if (CanonDefs[I].isRegmask() || CanonDefs[I].getReg().isPhysical())
           continue;
         int64_t Idx = sat::SolutionIntegerValue(Response,
                           getRegVar(UI->Defs[I], LM));
@@ -2561,7 +2561,7 @@ void Unison::generateInstructions() {
       SmallVector<CanonicalOperand, 8> CanonUses;
       getMIUsesInCanonicalOrder(*MI, CanonUses);
       for (unsigned I = 0; I < UI->Uses.size() && I < CanonUses.size(); ++I) {
-        if (!CanonUses[I].MO)
+        if (CanonUses[I].isRegmask())
           continue;
         UnisonUse *UseOp = UI->Uses[I];
         int64_t Choice = sat::SolutionIntegerValue(Response,
