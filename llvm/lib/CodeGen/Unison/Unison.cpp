@@ -1248,6 +1248,10 @@ void Unison::copyExtend() {
       if (ToSkip.contains(&Instr))
         continue;
 
+      // Track insertion point so SMs are appended in DefIdx order,
+      // not prepended (which would reverse them).
+      UnisonInstr *InsertAfterPt = &Instr;
+
       for (unsigned DefIdx = 0; DefIdx < Instr.Defs.size(); ++DefIdx) {
         UnisonDef *RealDef = Instr.Defs[DefIdx];
         if (RealDef->PotentialUses.empty())
@@ -1256,11 +1260,14 @@ void Unison::copyExtend() {
         unsigned NumRealUses = RealDef->PotentialUses.size();
 
         // --- Store-move: inserted right AFTER the def instruction ---
+        // We advance InsertAfterPt so successive SMs appear in
+        // DefIdx order (d0.SM, d1.SM, d2.SM, ...).
         SmallVector<unsigned, 3> SMOpcodes = {COPY_MOVE, COPY_STORE};
         if (Instr.K == UnisonInstr::LiveInDef)
           SMOpcodes.push_back(COPY_MEM);
         UnisonInstr *StoreMove = createCopyOp(SMOpcodes);
-        UMBB->insertAfter(&Instr, StoreMove);
+        UMBB->insertAfter(InsertAfterPt, StoreMove);
+        InsertAfterPt = StoreMove;
         ToSkip.insert(StoreMove);
         wireDefUse(RealDef, StoreMove->Uses[0]);
         UnisonDef *StoreMoveDef = StoreMove->Defs[0];
@@ -1489,10 +1496,9 @@ void Unison::addNoOverlapConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
       UnisonDef *DefOp = UInstr->Defs[DI];
       int UB = UMBB.IssueCycleUpperBound;
 
-      // Rectangle starts at IC + (latency - 1), when the write completes
-      // in the pipeline. For a 2-stage pipeline (latency=2), this is IC+1.
-      // TODO: generalize to per-instruction latencies for real pipelines.
-      static constexpr int PipelineLatency = 2;
+      // Rectangle starts at IC (the issue cycle of the definer), matching
+      // the original Unison model: start(t) = issue(definer(t)).
+      static constexpr int PipelineLatency = 1;
       sat::IntVar TimeStart = M.NewIntVar({0, UB + PipelineLatency});
       M.AddEquality(TimeStart,
                          getICVar(UInstr, M) + (PipelineLatency - 1));
@@ -1701,13 +1707,9 @@ void Unison::addSchedConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
 
 void Unison::addDataDependencyConstraints(UnisonMBB &UMBB,
                                           sat::CpModelBuilder &M) {
-  // Latency = 2 for the 2-stage pipeline: a def at IC=K writes at
-  // stage 1 (time K+1). A use must be at IC >= K+2 so it reads at
-  // stage 0 (time K+2), one time unit after the write completes.
-  // This prevents write/read boundary collisions at the same time
-  // point.
-  // // TODO: generalize latency per instruction for real pipeline models.
-  static constexpr int Latency = 2;
+  // Latency = 1: a use must be issued at least one cycle after its
+  // definer, matching the original Unison model: issue(u) >= issue(d) + 1.
+  static constexpr int Latency = 1;
   for (auto &UInstrPtr : UMBB.Instrs) {
     UnisonInstr *UInstr = &UInstrPtr;
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
@@ -1725,11 +1727,15 @@ void Unison::addAntiDependencyConstraints(UnisonMBB &UMBB,
                                           sat::CpModelBuilder &M) {
   // WAR (Write After Read) anti-dependencies: if instruction A reads
   // a register variable V, and a later instruction B (in original order)
-  // defines the same variable V, then IC(A) < IC(B).
+  // defines the same variable V, then IC(A) <= IC(B).
   //
   // Walk instructions in original order. For each use, record the
   // Reg.Var it reads from. For each def, check if any earlier use
   // read from the same Reg.Var.
+  //
+  // Note: this only tracks same-variable anti-dependencies. Cross-variable
+  // conflicts (different IntVars assigned the same register) are handled
+  // by the post-solve topological sort in sortByIssueCycle.
 
   // Map from Reg.Var index to the instructions that read it.
   // We use the IntVar's index as the key.
@@ -1746,7 +1752,6 @@ void Unison::addAntiDependencyConstraints(UnisonMBB &UMBB,
         for (UnisonInstr *Reader : It->second) {
           if (Reader == UInstr)
             continue;
-          // TODO: only add antidependency if both instructions are active.
           M.AddLessOrEqual(getICVar(Reader, M), getICVar(UInstr, M));
         }
       }
@@ -2561,7 +2566,7 @@ void Unison::generateInstructions() {
       SmallVector<CanonicalOperand, 8> CanonUses;
       getMIUsesInCanonicalOrder(*MI, CanonUses);
       for (unsigned I = 0; I < UI->Uses.size() && I < CanonUses.size(); ++I) {
-        if (CanonUses[I].isRegmask())
+        if (CanonUses[I].isRegmask() || CanonUses[I].getReg().isPhysical())
           continue;
         UnisonUse *UseOp = UI->Uses[I];
         int64_t Choice = sat::SolutionIntegerValue(Response,
@@ -2595,7 +2600,10 @@ void Unison::generateInstructions() {
     }
     MBB->sortUniqueLiveIns();
 
-    // Emit all instructions in IC order.
+    // Emit all instructions in IC order. With PipelineLatency=1,
+    // the NoOverlap2D rectangles start at IC (not IC+1), preventing
+    // two instructions at the same IC from conflicting on the same
+    // register. Simple sequential emission is correct.
     for (auto &UIP : UMBB.Instrs) {
       UnisonInstr *UI = &UIP;
 
