@@ -614,6 +614,7 @@ private:
   void addDataDependencyConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
   void addAntiDependencyConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
   void addOrderingConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
+  void addResourceConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M);
 
   // Cross-MBB constraints (GlobalModel).
   // Explicit congruence: LiveOut(pred) == LiveIn(succ) per CFG edge.
@@ -1494,11 +1495,16 @@ void Unison::addNoOverlapConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
 
     for (unsigned DI = 0; DI < UInstr->Defs.size(); ++DI) {
       UnisonDef *DefOp = UInstr->Defs[DI];
+
       int UB = UMBB.IssueCycleUpperBound;
 
-      // Rectangle starts at IC (the issue cycle of the definer), matching
-      // the original Unison model: start(t) = issue(definer(t)).
-      static constexpr int PipelineLatency = 1;
+      // Rectangle starts at IC + 1. An instruction issued at IC reads
+      // its inputs at IC and writes its output at IC + 1. This allows
+      // an instruction to use and define the same register (the use
+      // reads at IC, the def's rectangle starts at IC + 1).
+      // Cross-instruction same-IC conflicts are handled by the
+      // post-solve linearization in sortByIssueCycle.
+      static constexpr int PipelineLatency = 2;
       sat::IntVar TimeStart = M.NewIntVar({0, UB + PipelineLatency});
       M.AddEquality(TimeStart,
                          getICVar(UInstr, M) + (PipelineLatency - 1));
@@ -1584,8 +1590,18 @@ void Unison::addRegClassConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
         sat::BoolVar Chosen = getDChosenInU(M, UInstr->Defs[DI], U);
 
         if (User->K == UnisonInstr::RealInstr) {
-          // Real instructions read from registers only.
-          restrictToDomain(DefReg, PhysRegDomain, Chosen, M);
+          // Constrain source to the use operand's register class
+          // (or exact register for physical register operands).
+          if (U->Reg.isValid() && U->Reg.isPhysical() &&
+              MCRegToIdx.count(MCRegister(U->Reg))) {
+            M.AddEquality(DefReg, MCRegToIdx[MCRegister(U->Reg)])
+                .OnlyEnforceIf(Chosen);
+          } else if (U->Reg.isValid() && U->Reg.isVirtual()) {
+            const TargetRegisterClass *RC = A.MRI->getRegClass(U->Reg);
+            restrictToDomain(DefReg, RCDomain[RC], Chosen, M);
+          } else {
+            restrictToDomain(DefReg, PhysRegDomain, Chosen, M);
+          }
 
         } else if (User->isCopyOp()) {
           // CopyOp source requirement depends on instruction alternative.
@@ -1703,12 +1719,14 @@ void Unison::addSchedConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
   addDataDependencyConstraints(UMBB, M);
   addAntiDependencyConstraints(UMBB, M);
   addOrderingConstraints(UMBB, M);
+  addResourceConstraints(UMBB, M);
 }
 
 void Unison::addDataDependencyConstraints(UnisonMBB &UMBB,
                                           sat::CpModelBuilder &M) {
-  // Latency = 1: a use must be issued at least one cycle after its
-  // definer, matching the original Unison model: issue(u) >= issue(d) + 1.
+  // Latency = 1: with unique ICs (enforced by the resource constraint),
+  // the next instruction is at IC+1. On a single-issue processor with
+  // hardware interlocks, the result is available to the next instruction.
   static constexpr int Latency = 1;
   for (auto &UInstrPtr : UMBB.Instrs) {
     UnisonInstr *UInstr = &UInstrPtr;
@@ -1841,6 +1859,19 @@ void Unison::addOrderingConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
         M.AddGreaterThan(getICVar(&UIP, M), MaxAll);
     }
   }
+}
+
+void Unison::addResourceConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
+  // Single-issue processor: at most one instruction per cycle.
+  // All non-boundary instructions must have distinct ICs.
+  SmallVector<sat::IntVar, 32> AllICs;
+  for (auto &UIP : UMBB.Instrs) {
+    if (UIP.K == UnisonInstr::LiveInDef || UIP.K == UnisonInstr::LiveOutUse)
+      continue;
+    AllICs.push_back(getICVar(&UIP, M));
+  }
+  if (AllICs.size() > 1)
+    M.AddAllDifferent(AllICs);
 }
 
 sat::BoolVar Unison::getIsNotIdentityCopy(UnisonInstr *UInstr,
@@ -2600,10 +2631,7 @@ void Unison::generateInstructions() {
     }
     MBB->sortUniqueLiveIns();
 
-    // Emit all instructions in IC order. With PipelineLatency=1,
-    // the NoOverlap2D rectangles start at IC (not IC+1), preventing
-    // two instructions at the same IC from conflicting on the same
-    // register. Simple sequential emission is correct.
+    // Emit all instructions in IC order.
     for (auto &UIP : UMBB.Instrs) {
       UnisonInstr *UI = &UIP;
 
