@@ -1878,15 +1878,26 @@ void Unison::addOrderingConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
 
 void Unison::addResourceConstraints(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
   // Single-issue processor: at most one instruction per cycle.
-  // All non-boundary instructions must have distinct ICs.
-  SmallVector<sat::IntVar, 32> AllICs;
+  // Modeled as a cumulative resource (decoder) with capacity 1.
+  // Each active instruction occupies the decoder for 1 cycle.
+  // Inactive CopyOps use optional intervals and don't consume
+  // the resource, freeing IC slots for active instructions.
+  sat::CumulativeConstraint Cumul = M.AddCumulative(/*capacity=*/1);
   for (auto &UIP : UMBB.Instrs) {
     if (UIP.K == UnisonInstr::LiveInDef || UIP.K == UnisonInstr::LiveOutUse)
       continue;
-    AllICs.push_back(getICVar(&UIP, M));
+    sat::IntVar IC = getICVar(&UIP, M);
+    if (UIP.isCopyOp()) {
+      auto AIt = IsActiveVar.find(&UIP);
+      assert(AIt != IsActiveVar.end());
+      Cumul.AddDemand(
+          M.NewOptionalFixedSizeIntervalVar(IC, /*size=*/1, AIt->second),
+          /*demand=*/1);
+    } else {
+      Cumul.AddDemand(M.NewFixedSizeIntervalVar(IC, /*size=*/1),
+                      /*demand=*/1);
+    }
   }
-  if (AllICs.size() > 1)
-    M.AddAllDifferent(AllICs);
 }
 
 sat::BoolVar Unison::getIsNotIdentityCopy(UnisonInstr *UInstr,
