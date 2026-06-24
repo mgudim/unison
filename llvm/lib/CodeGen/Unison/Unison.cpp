@@ -2071,11 +2071,31 @@ void Unison::addMinimizeMakespanObjective(sat::LinearExpr &Objective,
 }
 
 void Unison::addObjectiveFunction() {
-  // GlobalModel objective: penalize callee-saved register usage + spills.
+  // GlobalModel objective: penalize callee-saved register usage + spills
+  // + boundary register changes (live-in != live-out for the same vreg).
   {
     sat::LinearExpr GlobalObjective;
     penalizeCalleeSavedRegisters(GlobalObjective, GlobalModel);
     penalizeGlobalSpills(GlobalObjective, GlobalModel);
+
+    // Penalize boundary register changes: if a vreg enters a block in
+    // one register but exits in another, the local model will need
+    // copies to shuffle it. Weight by block frequency.
+    for (auto &UMBB : UFunc.MBBs) {
+      int64_t Freq = A.MBFI->getBlockFreq(UMBB->MBB).getFrequency();
+      int64_t Weight = std::max<int64_t>(Freq / 100, 1);
+      for (auto &[InKey, InVar] : GlobalLiveInVar) {
+        if (InKey.first != UMBB.get())
+          continue;
+        auto OutIt = GlobalLiveOutVar.find({UMBB.get(), InKey.second});
+        if (OutIt == GlobalLiveOutVar.end())
+          continue;
+        sat::BoolVar Changed =
+            reifyNotEqual(InVar, OutIt->second, GlobalModel);
+        GlobalObjective += Weight * Changed;
+      }
+    }
+
     GlobalModel.Minimize(GlobalObjective);
   }
 
