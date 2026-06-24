@@ -1104,6 +1104,21 @@ void Unison::createUnisonProgramRepresentation() {
   LLVM_DEBUG(dbgs() << "  CrossBlockVRegs: " << CrossBlockVRegs.size() << "\n");
 
   copyExtend();
+
+  // Recompute IC upper bounds now that copy-extend has added SM/LM
+  // instructions. With AllDifferent on ICs, we need at least as many
+  // IC slots as total instructions.
+  for (auto &UMBB : UFunc.MBBs) {
+    unsigned TotalInstrs = 0;
+    for (auto &UI : UMBB->Instrs) {
+      if (UI.K != UnisonInstr::LiveInDef && UI.K != UnisonInstr::LiveOutUse)
+        ++TotalInstrs;
+    }
+    // Add headroom for the LiveInDef and LiveOutUse ICs, plus some slack.
+    UMBB->IssueCycleUpperBound =
+        std::max(UMBB->IssueCycleUpperBound,
+                 static_cast<int>(TotalInstrs + 2));
+  }
 }
 
 void Unison::createVariables() {
