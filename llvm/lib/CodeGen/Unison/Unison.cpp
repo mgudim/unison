@@ -1709,6 +1709,20 @@ void Unison::deriveActivationVars(UnisonMBB &UMBB, sat::CpModelBuilder &M) {
       IsActiveVar[UInstr] = Active;
     }
     NS.nameActiveVar(UInstr, IsActiveVar[UInstr]);
+
+    // Identity copy constraint: if source and destination registers
+    // are the same, the copy is a no-op and must be inactive.
+    // This prevents identity copies from creating NoOverlap2D
+    // rectangles that block the original def.
+    //   IsActive => (SrcReg != DstReg)
+    UnisonUse *UseOp = UInstr->Uses[0];
+    for (unsigned K = 0; K < UseOp->PotentialDefs.size(); ++K) {
+      UnisonDef *SrcDef = UseOp->PotentialDefs[K];
+      sat::IntVar SrcReg = getRegVar(SrcDef, M);
+      sat::IntVar DstReg = getRegVar(UInstr->Defs[0], M);
+      M.AddNotEqual(SrcReg, DstReg)
+          .OnlyEnforceIf(IsActiveVar[UInstr]);
+    }
   }
 }
 
